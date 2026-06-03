@@ -1,0 +1,12 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.suo
+*.sln
+*.vcxproj*
+Makefile
