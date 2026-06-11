@@ -15,6 +15,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Freetype REQUIRED)
 find_package(OpenGL   REQUIRED)
 
+# HarfBuzz (GPOS/OpenType layout kerning) — optional but enabled when found
+find_package(PkgConfig QUIET)
+set(IMVARFONT_HARFBUZZ_FOUND FALSE)
+if(PkgConfig_FOUND)
+    pkg_check_modules(HARFBUZZ QUIET IMPORTED_TARGET harfbuzz)
+    if(HARFBUZZ_FOUND)
+        set(IMVARFONT_HARFBUZZ_FOUND TRUE)
+    endif()
+endif()
+
 include(FetchContent)
 
 # Dear ImGui  (docking branch – enables ImGuiDockspace for future use)
@@ -80,6 +90,13 @@ target_link_libraries(imvarfont PUBLIC
     Freetype::Freetype
     imgui_impl
 )
+if(IMVARFONT_HARFBUZZ_FOUND)
+    target_compile_definitions(imvarfont PUBLIC IMVARFONT_USE_HARFBUZZ)
+    target_link_libraries(imvarfont PUBLIC PkgConfig::HARFBUZZ)
+    message(STATUS "ImVarFont: HarfBuzz enabled (GPOS kerning)")
+else()
+    message(STATUS "ImVarFont: HarfBuzz not found — legacy kern table only")
+endif()
 
 # ---------------------------------------------------------------------------
 # Example executable

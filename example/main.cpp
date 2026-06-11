@@ -11,9 +11,17 @@
 
 #include <nfd.h>
 #include <GLFW/glfw3.h>
+#ifdef _WIN32
+#include <GL/gl.h>
+#elif defined(__APPLE__)
+#include <OpenGL/gl3.h>
+#else
+#include <GL/gl.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <algorithm>
 
 // ---------------------------------------------------------------------------
@@ -25,8 +33,11 @@ static char             g_fontPath[512] = "";
 static char             g_loadError[256] = "";
 
 static char             g_text[4096]  = "The quick brown fox\njumps over the lazy dog";
-static float            g_emPx        = 140.f;
-static float            g_thickness   = 1.5f;
+static float            g_emPx           = 140.f;
+static float            g_lineHeightMult = 1.f;
+static float            g_letterSpacingEm = 0.f;
+static float            g_thickness      = 1.5f;
+static bool             g_outline        = false;
 static ImVec4           g_textColor   = { 1.00f, 1.00f, 1.00f, 1.00f };
 static ImVec4           g_bgColor     = { 0.04f, 0.04f, 0.07f, 1.00f };
 
@@ -41,6 +52,14 @@ static bool             g_dockLayoutBuilt  = false;
 
 static ImVec2           g_previewPan       = { 0.f, 0.f };
 static float            g_previewZoom      = 1.f;
+
+static int              g_renderModeIdx    = 0;
+static int              g_hintingIdx       = 0;
+static bool             g_rasterDirty      = true;
+static unsigned int     g_rasterTex        = 0;
+static int              g_rasterTexW       = 0;
+static int              g_rasterTexH       = 0;
+static std::vector<uint8_t> g_rasterPixels;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -60,6 +79,7 @@ static void tryLoadFont() {
     if (g_face)
         ImVarFont::ApplyAxes(g_face, g_extrapolate);
     g_uiFontDirty = true;
+    g_rasterDirty = true;
 }
 
 static ImFont* loadSystemUiFont(ImFontAtlas* atlas, float size_px) {
@@ -130,26 +150,27 @@ static const char* kSampleTexts[] = {
     nullptr
 };
 
-static float calcLineWidth(ImVarFont::Face* face, float emPx,
+static float calcLineWidth(ImVarFont::Face* face, float emPx, float letterSpacingPx,
                            const char* start, const char* end) {
     if (start >= end) return 0.f;
     std::string line(start, (size_t)(end - start));
-    return ImVarFont::CalcTextWidth(face, emPx, line.c_str());
+    return ImVarFont::CalcTextWidth(face, emPx, line.c_str(), letterSpacingPx);
 }
 
 // Measure widest line and total block height for multiline preview centring
-static void calcTextBlock(ImVarFont::Face* face, float emPx, const char* text,
+static void calcTextBlock(ImVarFont::Face* face, float emPx, float lineHeightPx,
+                          float letterSpacingPx, const char* text,
                           float* outW, float* outH) {
     const float asc   = ImVarFont::CalcAscenderPx(face, emPx);
     const float desc  = ImVarFont::CalcDescenderPx(face, emPx);
-    const float lineH = ImVarFont::CalcLineHeightPx(face, emPx);
+    const float lineH = lineHeightPx;
 
     float maxW = 0.f;
     int   lines = 1;
     const char* lineStart = text;
     for (const char* p = text; ; ++p) {
         if (*p == '\n' || *p == '\0') {
-            maxW = std::max(maxW, calcLineWidth(face, emPx, lineStart, p));
+            maxW = std::max(maxW, calcLineWidth(face, emPx, letterSpacingPx, lineStart, p));
             if (*p == '\0') break;
             ++lines;
             lineStart = p + 1;
@@ -158,6 +179,36 @@ static void calcTextBlock(ImVarFont::Face* face, float emPx, const char* text,
 
     *outW = maxW;
     *outH = asc + desc + (lines - 1) * lineH;
+}
+
+static void syncRenderSettings() {
+    if (!g_face) return;
+    ImVarFont::SetRenderMode(g_face, (ImVarFont::RenderMode)g_renderModeIdx);
+    ImVarFont::SetHintingFlags(g_face, (ImVarFont::HintingFlags)g_hintingIdx);
+}
+
+static void uploadRasterTexture(const std::vector<uint8_t>& px, int w, int h) {
+    if (g_rasterTex == 0)
+        glGenTextures(1, &g_rasterTex);
+    glBindTexture(GL_TEXTURE_2D, g_rasterTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    if (w != g_rasterTexW || h != g_rasterTexH) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        g_rasterTexW = w;
+        g_rasterTexH = h;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    }
+}
+
+static void freeRasterTexture() {
+    if (g_rasterTex != 0) {
+        glDeleteTextures(1, &g_rasterTex);
+        g_rasterTex = 0;
+    }
+    g_rasterTexW = g_rasterTexH = 0;
+    g_rasterPixels.clear();
 }
 
 // GLFW drag-and-drop: accept the first dropped file as the font path
@@ -180,10 +231,12 @@ static void SetupDockLayout(ImGuiID dockspace_id) {
     ImGuiID dock_main  = dockspace_id;
     ImGuiID dock_left  = ImGui::DockBuilderSplitNode(dock_main, ImGuiDir_Left,  0.22f, nullptr, &dock_main);
     ImGuiID dock_right = ImGui::DockBuilderSplitNode(dock_main, ImGuiDir_Right, 0.26f, nullptr, &dock_main);
+    ImGuiID dock_bottom = ImGui::DockBuilderSplitNode(dock_main, ImGuiDir_Down, 0.28f, nullptr, &dock_main);
 
-    ImGui::DockBuilderDockWindow("Controls", dock_left);
-    ImGui::DockBuilderDockWindow("Preview",  dock_main);
-    ImGui::DockBuilderDockWindow("Metadata", dock_right);
+    ImGui::DockBuilderDockWindow("Controls",  dock_left);
+    ImGui::DockBuilderDockWindow("Preview",   dock_main);
+    ImGui::DockBuilderDockWindow("Metadata",  dock_right);
+    ImGui::DockBuilderDockWindow("Kern table", dock_bottom);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
@@ -279,6 +332,7 @@ static void DrawControls() {
             if (ImGui::Selectable(kSampleTexts[i], selected)) {
                 strncpy(g_text, kSampleTexts[i], sizeof(g_text) - 1);
                 g_text[sizeof(g_text) - 1] = '\0';
+                g_rasterDirty = true;
             }
             if (selected)
                 ImGui::SetItemDefaultFocus();
@@ -287,31 +341,106 @@ static void DrawControls() {
     }
 
     ImGui::SetNextItemWidth(-1.f);
-    ImGui::InputTextMultiline("##text", g_text, sizeof(g_text),
-                              ImVec2(-1.f, 90.f * g_dpi_scale));
+    if (ImGui::InputTextMultiline("##text", g_text, sizeof(g_text),
+                              ImVec2(-1.f, 90.f * g_dpi_scale)))
+        g_rasterDirty = true;
 
     ImGui::Spacing();
     ImGui::Text("Size (px)");
     ImGui::SetNextItemWidth(-1.f);
-    ImGui::SliderFloat("##emPx", &g_emPx, 12.f, 600.f, "%.0f px");
+    if (ImGui::SliderFloat("##emPx", &g_emPx, 12.f, 600.f, "%.0f px"))
+        g_rasterDirty = true;
 
-    ImGui::Text("Stroke thickness");
+    ImGui::Text("Line height");
     ImGui::SetNextItemWidth(-1.f);
-    ImGui::SliderFloat("##thick", &g_thickness, 0.5f, 8.f, "%.1f px");
+    if (ImGui::SliderFloat("##lineH", &g_lineHeightMult, 0.5f, 3.f, "%.2f×"))
+        g_rasterDirty = true;
+
+    ImGui::Text("Letter spacing");
+    ImGui::SetNextItemWidth(-1.f);
+    if (ImGui::SliderFloat("##letterSp", &g_letterSpacingEm, -0.2f, 0.5f, "%.3f em"))
+        g_rasterDirty = true;
+
+    ImGui::Text("Render mode");
+    ImGui::SetNextItemWidth(-1.f);
+    if (ImGui::Combo("##renderMode", &g_renderModeIdx,
+                     "Vector\0Hinted vector\0Raster\0")) {
+        syncRenderSettings();
+        g_rasterDirty = true;
+    }
+
+    if (g_renderModeIdx != 0) {
+        ImGui::Text("Hinting");
+        ImGui::SetNextItemWidth(-1.f);
+        if (ImGui::Combo("##hinting", &g_hintingIdx,
+                         "Native\0Light\0Auto-hint\0")) {
+            syncRenderSettings();
+            g_rasterDirty = true;
+        }
+    }
+
+    if (g_renderModeIdx == 2 && g_outline)
+        ImGui::TextDisabled("Outline applies to vector modes only");
+    if (g_outline) {
+        ImGui::Text("Outline thickness");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::SliderFloat("##thick", &g_thickness, 0.5f, 8.f, "%.1f px");
+    }
+
+    if (g_face) {
+        ImGui::SeparatorText("Kerning");
+
+        bool kern = ImVarFont::GetUseKerning(g_face);
+        if (ImGui::Checkbox("Kerning", &kern))
+            ImVarFont::SetUseKerning(g_face, kern);
+
+        ImGui::TextDisabled("Engine: %s", ImVarFont::GetKerningEngineLabel(g_face));
+
+        if (ImVarFont::UsesHarfBuzz(g_face)) {
+            bool use_hb = ImVarFont::GetUseHarfBuzz(g_face);
+            if (ImGui::Checkbox("Use HarfBuzz", &use_hb))
+                ImVarFont::SetUseHarfBuzz(g_face, use_hb);
+            if (!ImVarFont::HasGpos(g_face))
+                ImGui::TextDisabled("(font has no GPOS table)");
+        } else {
+            bool use_hb = false;
+            ImGui::BeginDisabled();
+            ImGui::Checkbox("Use HarfBuzz", &use_hb);
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("(not built with HarfBuzz)");
+        }
+
+        if (ImVarFont::HasKernTable(g_face)) {
+            bool use_kern = ImVarFont::GetUseKernTable(g_face);
+            if (ImGui::Checkbox("Use kern table", &use_kern))
+                ImVarFont::SetUseKernTable(g_face, use_kern);
+        } else {
+            bool use_kern = false;
+            ImGui::BeginDisabled();
+            ImGui::Checkbox("Use kern table", &use_kern);
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("(font has no kern table)");
+        }
+    }
 
     ImGui::Spacing();
     ImGui::ColorEdit3("Text",  (float*)&g_textColor, ImGuiColorEditFlags_NoInputs);
+    if (ImGui::IsItemEdited()) g_rasterDirty = true;
     ImGui::SameLine();
     ImGui::ColorEdit3("BG",    (float*)&g_bgColor,   ImGuiColorEditFlags_NoInputs);
 
     // ── Axes ─────────────────────────────────────────────────────────────────
     if (g_face && ImVarFont::IsVariable(g_face)) {
         ImGui::SeparatorText("Axes");
-        if (ImVarFont::AxisSliders(g_face, "##axes", g_extrapolate) && g_useFontForUi)
-            g_uiFontDirty = true;
+        if (ImVarFont::AxisSliders(g_face, "##axes", g_extrapolate)) {
+            if (g_useFontForUi) g_uiFontDirty = true;
+            g_rasterDirty = true;
+        }
         ImGui::Checkbox("Extrapolate beyond limits", &g_extrapolate);
-        if (ImGui::IsItemEdited() && g_face)
+        if (ImGui::IsItemEdited() && g_face) {
             ImVarFont::ApplyAxes(g_face, g_extrapolate);
+            g_rasterDirty = true;
+        }
     }
 
     ImGui::End();
@@ -349,6 +478,7 @@ static void DrawPreview() {
         g_previewZoom = std::clamp(g_previewZoom, 0.05f, 20.f);
         g_previewPan.x = io.MousePos.x - center.x - world.x * g_previewZoom;
         g_previewPan.y = io.MousePos.y - center.y - world.y * g_previewZoom;
+        g_rasterDirty = true;
     }
     if (canvasActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
         g_previewPan = { g_previewPan.x + io.MouseDelta.x,
@@ -356,12 +486,16 @@ static void DrawPreview() {
     if (canvasHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         g_previewPan  = { 0.f, 0.f };
         g_previewZoom = 1.f;
+        g_rasterDirty = true;
     }
 
     if (g_face) {
+        syncRenderSettings();
         const float emPx = g_emPx * g_previewZoom;
+        const float lineH = ImVarFont::CalcLineHeightPx(g_face, emPx) * g_lineHeightMult;
+        const float letterSp = g_letterSpacingEm * emPx;
         float textW = 0.f, textH = 0.f;
-        calcTextBlock(g_face, emPx, g_text, &textW, &textH);
+        calcTextBlock(g_face, emPx, lineH, letterSp, g_text, &textW, &textH);
 
         const ImVec2 center = {
             canvasPos.x + canvasSize.x * 0.5f,
@@ -371,12 +505,29 @@ static void DrawPreview() {
         const float posY = center.y - textH * 0.5f + g_previewPan.y;
 
         ImU32 col = ImGui::ColorConvertFloat4ToU32(g_textColor);
-        ImVarFont::AddText(ImGui::GetWindowDrawList(), g_face,
-                           emPx, { posX, posY },
-                           col, g_text, g_thickness * g_previewZoom);
+        ImU32 bgCol = ImGui::ColorConvertFloat4ToU32(g_bgColor);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
 
-        if (canvasHovered) {
-            ImGui::SetTooltip("Scroll: zoom  ·  Drag: pan  ·  Double-click: reset");
+        if (g_renderModeIdx == (int)ImVarFont::RenderMode::Raster) {
+            if (g_rasterDirty) {
+                int rw = 0, rh = 0;
+                if (ImVarFont::RasterizeText(g_face, emPx, g_text, col, lineH, letterSp,
+                                             g_rasterPixels, rw, rh)) {
+                    uploadRasterTexture(g_rasterPixels, rw, rh);
+                }
+                g_rasterDirty = false;
+            }
+            if (g_rasterTex != 0 && g_rasterTexW > 0 && g_rasterTexH > 0) {
+                const float drawX = center.x - g_rasterTexW * 0.5f + g_previewPan.x;
+                const float drawY = center.y - g_rasterTexH * 0.5f + g_previewPan.y;
+                dl->AddImage((ImTextureID)(intptr_t)g_rasterTex,
+                             { drawX, drawY },
+                             { drawX + (float)g_rasterTexW, drawY + (float)g_rasterTexH });
+            }
+        } else {
+            ImVarFont::AddText(dl, g_face, emPx, { posX, posY },
+                               col, g_text, g_outline,
+                               g_thickness * g_previewZoom, lineH, letterSp, bgCol);
         }
     } else {
         const char* hint = "Drop a .ttf / .otf file here,  or enter its path and press Load";
@@ -399,6 +550,12 @@ static void DrawMetadata() {
 
     ImVarFont::MetadataTable(g_face);
 
+    ImGui::End();
+}
+
+static void DrawKernTable() {
+    ImGui::Begin("Kern table");
+    ImVarFont::KernTableUi(g_face, g_emPx);
     ImGui::End();
 }
 
@@ -479,6 +636,7 @@ int main(int /*argc*/, char** /*argv*/) {
         DrawControls();
         DrawPreview();
         DrawMetadata();
+        DrawKernTable();
 
         // ── Render ──────────────────────────────────────────────────────────
         ImGui::Render();
@@ -493,6 +651,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
     ImVarFont::FreeFace(g_face);
+    freeRasterTexture();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

@@ -4,13 +4,13 @@ Variable-font rendering and axis controls for [Dear ImGui](https://github.com/oc
 
 ![preview](example/preview.png)
 
-Renders glyph outlines as stroked paths directly into an `ImDrawList` using
-FreeType for outline extraction.  Variable-font design axes (weight, width,
-custom axes like scanline or horizontal bleed) are automatically discovered
-from the font file and exposed as ImGui slider widgets.
+Renders glyph outlines directly into an `ImDrawList` using FreeType for outline
+extraction.  Variable-font design axes (weight, width, custom axes like scanline
+or horizontal bleed) are automatically discovered from the font file and exposed
+as ImGui slider widgets.
 
-No texture atlas is required — outlines are tessellated on the fly via
-`ImDrawList::PathBezierCubicCurveTo`.
+No texture atlas is required for vector modes — outlines are tessellated on the
+fly via `ImDrawList::PathBezierCubicCurveTo`.
 
 ---
 
@@ -20,6 +20,10 @@ No texture atlas is required — outlines are tessellated on the fly via
 - Axes discovered automatically from the font's `fvar` table
 - `AxisSliders()` — one `SliderFloat` per axis with the axis name and 4-char tag
 - `MetadataTable()` — family/style, variable flag, axis min/max/default table, live values
+- Three preview render modes: **Vector**, **Hinted vector**, **Raster**
+- Filled glyph rendering with correct counters (holes punched via background colour in vector modes)
+- Optional outline (stroke-only) preview mode
+- Optional HarfBuzz GPOS kerning when built with `IMVARFONT_USE_HARFBUZZ`
 - Self-contained: two files (`imgui_var_font.h` + `imgui_var_font.cpp`)
 - Follows Dear ImGui naming conventions (PascalCase members, snake_case parameters)
 
@@ -38,13 +42,22 @@ if (ImVarFont::AxisSliders(face))
     ImVarFont::ApplyAxes(face);          // push new axis values to FreeType
 
 float w = ImVarFont::CalcTextWidth(face, 96.f, "Hello");
+ImU32 text_col = IM_COL32(255, 255, 255, 255);
+ImU32 bg_col   = IM_COL32(10, 10, 18, 255);   // hole punch in vector modes
+
+ImVarFont::SetRenderMode(face, ImVarFont::RenderMode::HintedVector);
+ImVarFont::SetHintingFlags(face, ImVarFont::HintingFlags::Native);
+
 ImVarFont::AddText(
     ImGui::GetWindowDrawList(), face,
     96.f,                                // em size in pixels
-    ImVec2((width - w) * 0.5f, y),       // centred position
-    IM_COL32_WHITE,
+    ImVec2((width - w) * 0.5f, y),       // top-left of text block
+    text_col,
     "Hello",
-    1.5f);                               // stroke thickness
+    false,                               // outline mode (stroke only)
+    1.5f,                                // outline thickness (px)
+    0.f,                                 // line height (0 = font default)
+    bg_col);                             // hole fill colour (0 = skip punch)
 
 // Cleanup
 ImVarFont::FreeFace(face);
@@ -52,50 +65,47 @@ ImVarFont::FreeFace(face);
 
 ---
 
-## API reference
+## Render modes
+
+| Mode | Hinting | Best for |
+|---|---|---|
+| **Vector** (default) | Off (`FT_LOAD_NO_SCALE \| FT_LOAD_NO_HINTING`) | Infinite zoom, axis extrapolation |
+| **Hinted vector** | On (`FT_Set_Char_Size` + native/light/auto-hint) | Crisper stems at small sizes, still scalable |
+| **Raster** | On + `FT_Render_Glyph` | Static preview quality closest to OS/imgui_freetype |
 
 ```cpp
-namespace ImVarFont {
+enum class RenderMode { Vector, HintedVector, Raster };
+enum class HintingFlags { Native, Light, AutoHint };
 
-struct Axis {
-    ImU32  Tag;       // 4-byte OpenType tag
-    char   Name[64];  // human-readable name from fvar
-    float  Min, Max, Default;
-    float  Value;     // current value – modify then call ApplyAxes()
-};
+void SetRenderMode(Face*, RenderMode);
+void SetHintingFlags(Face*, HintingFlags);
 
-// Lifecycle
-Face* LoadFace(const char* path);
-void  FreeFace(Face* face);
+// CPU RGBA composite — use with your own texture upload (see example)
+bool RasterizeText(Face*, float em_px, const char* text, ImU32 col,
+                   float line_height_px, std::vector<uint8_t>& out_rgba,
+                   int& out_w, int& out_h);
+```
 
-// Introspection
-bool        IsLoaded(const Face*);
-bool        IsVariable(const Face*);
-const char* GetFamilyName(const Face*);
-const char* GetStyleName(const Face*);
-const char* GetFilePath(const Face*);
+`AddText` is a no-op when render mode is **Raster**; call `RasterizeText` and blit the bitmap yourself.
 
-// Axis control
-int   GetAxisCount(const Face*);
-Axis* GetAxes(Face*);
-void  SetAxisValue(Face*, int axis_idx, float v);
-void  ResetAxes(Face*);          // resets all + calls ApplyAxes()
-void  ApplyAxes(Face*);          // pushes Axis::Value to FreeType
+---
 
-// Widgets
-bool AxisSliders(Face*, const char* str_id = "##imvarfont_axes");
-void MetadataTable(const Face*);
+## API reference
 
-// Rendering
+See `imgui_var_font.h` for the full API.  Key rendering entry points:
+
+```cpp
 float AddText(ImDrawList*, Face*, float em_px, ImVec2 pos,
-              ImU32 col, const char* text, float thickness = 1.5f);
+              ImU32 col, const char* text,
+              bool outline = false,
+              float outline_thickness = 1.5f,
+              float line_height_px = 0.f,
+              ImU32 hole_col = 0);
+
 float CalcTextWidth(Face*, float em_px, const char* text);
-
-// Tag helpers
-ImU32 MakeTag(char a, char b, char c, char d);
-void  TagToStr(ImU32 tag, char out[5]);
-
-} // namespace ImVarFont
+float CalcAscenderPx(const Face*, float em_px);
+float CalcDescenderPx(const Face*, float em_px);
+float CalcLineHeightPx(const Face*, float em_px);
 ```
 
 ---
@@ -142,26 +152,22 @@ cmake --build build
 
 ---
 
-## Suggested test font
-
-[Home Computer Fonts](https://github.com/13-Types/homecomputer-fonts) by
-13 Types — variable fonts based on Commodore 64 and Amiga bitmap typefaces.
-The scanline density and horizontal bleed axes make the sliders immediately
-dramatic and are a natural fit for pen-plotter output.
-
----
-
 ## Rendering notes
 
-- `AddText` treats `pos` as the **top-left corner** of the em square.
-  The text baseline sits at `pos.y + ascender * scale`.
-- Outlines use `FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING`; variation blending
-  is applied by `ApplyAxes()` via `FT_Set_Var_Design_Coordinates()`.
-- Quadratic (TrueType conic) Béziers are upgraded to cubics using
-  `cp1 = P0 + ⅔(P1−P0)`, `cp2 = P2 + ⅔(P1−P2)` before being passed to
-  `ImDrawList::PathBezierCubicCurveTo()`.
-- Filled glyphs (requiring contour triangulation) are left as future work;
-  stroke-only output is the right primitive for plotter workflows.
+- `AddText` treats `pos` as the **top-left corner** of the text block.
+  The baseline sits at `pos.y + ascender * scale`.
+- **Vector mode** loads unhinted design-unit outlines and scales linearly — best
+  for zooming and axis extrapolation, but softer at small pixel sizes.
+- **Hinted vector** loads outlines at the target em size with FreeType hinting;
+  stems align to the pixel grid. Hinting may shift slightly when axis sliders move.
+- **Raster mode** uses FreeType's grayscale renderer; re-rasterize when size or
+  axes change (the example re-rasterizes on zoom).
+- **Filled vector modes**: outer contours are filled with `col`.  Counter holes
+  are punched by filling hole contours with `hole_col` — pass the canvas
+  background colour for correct results.
+- **Outline mode** (`outline = true`): contours are stroked only, no fill.
+- Quadratic (TrueType conic) Béziers are upgraded to cubics before being passed
+  to `ImDrawList::PathBezierCubicCurveTo()`.
 
 ---
 

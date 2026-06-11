@@ -21,8 +21,35 @@
 
 #pragma once
 #include "imgui.h"
+#include <cstdint>
+#include <vector>
 
 namespace ImVarFont {
+
+// ---------------------------------------------------------------------------
+// Render quality
+// ---------------------------------------------------------------------------
+
+enum class RenderMode {
+    Vector,        // Unhinted design-unit outlines (best for zoom / extrapolation)
+    HintedVector,  // Hinted outlines at em_px, drawn as ImDrawList paths
+    Raster,        // FreeType grayscale bitmap composite (best static quality)
+};
+
+enum class HintingFlags {
+    Native,    // Font native hinter + FT_LOAD_TARGET_NORMAL
+    Light,     // FT_LOAD_TARGET_LIGHT (ClearType-style vertical snap)
+    AutoHint,  // FT_LOAD_FORCE_AUTOHINT
+};
+
+struct Face;
+
+RenderMode    GetRenderMode(const Face* face);
+void          SetRenderMode(Face* face, RenderMode mode);
+HintingFlags  GetHintingFlags(const Face* face);
+void          SetHintingFlags(Face* face, HintingFlags flags);
+const char*   GetRenderModeLabel(RenderMode mode);
+const char*   GetHintingFlagsLabel(HintingFlags flags);
 
 // ---------------------------------------------------------------------------
 // Axis  –  one per design axis in the font
@@ -37,13 +64,10 @@ struct Axis {
 };
 
 // ---------------------------------------------------------------------------
-// Opaque face handle
+// Opaque face handle (defined internally)
 // ---------------------------------------------------------------------------
-struct Face;
 
-// ---------------------------------------------------------------------------
 // Lifecycle
-// ---------------------------------------------------------------------------
 
 // Load a font file.  Works with static and variable OTF/TTF fonts.
 // Returns nullptr on failure.
@@ -62,6 +86,44 @@ bool        IsVariable(const Face* face);
 const char* GetFamilyName(const Face* face);  // e.g. "Inter"
 const char* GetStyleName(const Face* face);   // e.g. "Regular"
 const char* GetFilePath(const Face* face);
+
+// True when the font has any kerning source (legacy kern table and/or GPOS).
+bool HasKerning(const Face* face);
+
+// True when the font file contains a legacy 'kern' table.
+bool HasKernTable(const Face* face);
+
+// True when the font file contains GPOS positioning data (requires HarfBuzz at build time).
+bool HasGpos(const Face* face);
+
+// True when HarfBuzz is linked and this face was shaped with it.
+bool UsesHarfBuzz(const Face* face);
+
+// Kerning master switch.
+bool GetUseKerning(const Face* face);
+void SetUseKerning(Face* face, bool enabled);
+
+// Use HarfBuzz / GPOS for pair spacing when kerning is on.
+bool GetUseHarfBuzz(const Face* face);
+void SetUseHarfBuzz(Face* face, bool enabled);
+
+// Use the legacy 'kern' table for pair spacing when kerning is on.
+bool GetUseKernTable(const Face* face);
+void SetUseKernTable(Face* face, bool enabled);
+
+// Active backend label: "off", "HarfBuzz (GPOS)", "kern table", "none", etc.
+const char* GetKerningEngineLabel(const Face* face);
+
+// Legacy 'kern' table pair value in pixels (0 if unavailable).
+float GetKernTablePairPx(const Face* face, unsigned int cp_left, unsigned int cp_right,
+                         float em_px);
+
+// Extra pair spacing from GPOS via HarfBuzz at em_px (0 if unavailable).
+float GetGposPairExtraPx(const Face* face, unsigned int cp_left, unsigned int cp_right,
+                          float em_px);
+
+// Scrollable inspector for non-zero kern pairs (ASCII subset).
+void KernTableUi(const Face* face, float em_px);
 
 // ---------------------------------------------------------------------------
 // Axis control
@@ -104,22 +166,31 @@ ImFont* SetImGuiFont(ImFontAtlas* atlas, Face* face, float size_pixels);
 // Rendering  (outlines → ImDrawList, no texture atlas required)
 // ---------------------------------------------------------------------------
 
-// Render UTF-8 text as stroked glyph outlines into dl.
+// Render UTF-8 text as filled glyph outlines into dl.
 //
-//   em_px     : em-square size in screen pixels  (controls text size)
-//   pos       : top-left corner of the text block in screen coordinates
-//               (baseline sits at pos.y + ascender * scale)
-//   col       : stroke colour, e.g. IM_COL32(255, 255, 255, 255)
-//   thickness : stroke width in pixels
+//   em_px              : em-square size in screen pixels  (controls text size)
+//   pos                : top-left corner of the text block in screen coordinates
+//                        (baseline sits at pos.y + ascender * scale)
+//   col                : fill colour, e.g. IM_COL32(255, 255, 255, 255)
+//   outline            : when true, stroke each contour on top of the fill
+//   outline_thickness  : stroke width in pixels (only used when outline is true)
+//   line_height_px     : vertical advance per newline; 0 = font default
+//   letter_spacing_px  : extra gap after each glyph except the last on a line; 0 = none
+//   hole_col           : fill colour for counter holes; 0 = skip hole punch
 //
 // Returns the total advance width of the rendered string in pixels.
 float AddText(ImDrawList* dl, Face* face,
               float em_px, ImVec2 pos,
               ImU32 col, const char* text,
-              float thickness = 1.5f);
+              bool outline = false,
+              float outline_thickness = 1.5f,
+              float line_height_px = 0.f,
+              float letter_spacing_px = 0.f,
+              ImU32 hole_col = 0);
 
 // Measure total advance width without rendering (useful for centring).
-float CalcTextWidth(Face* face, float em_px, const char* text);
+float CalcTextWidth(Face* face, float em_px, const char* text,
+                    float letter_spacing_px = 0.f);
 
 // Returns ascender height in pixels above the baseline (positive value).
 // Use with CalcDescenderPx to centre text properly in a canvas.
@@ -130,6 +201,13 @@ float CalcDescenderPx(const Face* face, float em_px);
 
 // Returns line spacing in pixels (matches AddText newline advance).
 float CalcLineHeightPx(const Face* face, float em_px);
+
+// Composite UTF-8 text to an RGBA8888 buffer (for Raster preview mode).
+// Returns false when face/text is invalid.  out_w/out_h are set to pixel size.
+bool RasterizeText(Face* face, float em_px, const char* text, ImU32 col,
+                   float line_height_px, float letter_spacing_px,
+                   std::vector<uint8_t>& out_rgba,
+                   int& out_w, int& out_h);
 
 // ---------------------------------------------------------------------------
 // Tag helpers
