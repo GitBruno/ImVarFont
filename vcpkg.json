@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Variable-font rendering and axis controls for Dear ImGui",
   "dependencies": [
-    "freetype"
+    "freetype",
+    "clipper2"
   ]
 }

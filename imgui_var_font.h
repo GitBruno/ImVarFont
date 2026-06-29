@@ -44,6 +44,18 @@ enum class HintingFlags {
 
 struct Face;
 
+// ---------------------------------------------------------------------------
+// GPU renderer lifecycle
+//
+// The analytic glyph renderer rasterizes coverage on the GPU. Call InitRenderer
+// once a GL context is current, passing your GL proc loader (e.g.
+// glfwGetProcAddress), and ShutdownRenderer before the context is destroyed. If
+// InitRenderer is not called (or fails), filled text falls back to the CPU path.
+// ---------------------------------------------------------------------------
+bool InitRenderer(void* (*gl_get_proc_address)(const char*));
+void ShutdownRenderer();
+bool RendererReady();
+
 RenderMode    GetRenderMode(const Face* face);
 void          SetRenderMode(Face* face, RenderMode mode);
 HintingFlags  GetHintingFlags(const Face* face);
@@ -126,6 +138,40 @@ float GetGposPairExtraPx(const Face* face, unsigned int cp_left, unsigned int cp
 void KernTableUi(const Face* face, float em_px);
 
 // ---------------------------------------------------------------------------
+// OpenType features  (GSUB/GPOS shaping: ligatures, small caps, stylistic sets…)
+//
+// Requires HarfBuzz at build time (IMVARFONT_USE_HARFBUZZ). Without HarfBuzz the
+// settings are stored but have no effect on shaping. Substitution features (e.g.
+// 'liga', 'smcp', 'onum', 'ss01') change which glyphs are produced, so shaping
+// runs through HarfBuzz whenever any feature is set — even for fonts with no GPOS.
+// ---------------------------------------------------------------------------
+
+struct FeatureSetting {
+    ImU32    Tag   = 0;            // 4-char OpenType feature tag, e.g. 'liga'
+    uint32_t Value = 1;           // 0 = off, 1 = on, N = select alternate N
+    uint32_t Start = 0;           // first cluster the setting applies to
+    uint32_t End   = 0xFFFFFFFFu; // one-past-last cluster (global by default)
+};
+
+// Enable/select a feature by 4-char tag ("liga", "smcp", "ss01", "onum"…).
+// value: 0 disables, 1 enables, N selects alternate N (for 'aalt'/'salt'/'cvNN').
+void SetFeature(Face* face, const char* tag, uint32_t value = 1);
+void SetFeatureRange(Face* face, const char* tag, uint32_t value,
+                     uint32_t start, uint32_t end);
+
+// Parse a comma/space separated list and replace the current feature set, e.g.
+// "liga, ss01=1, onum, -kern, +smcp". Returns the number of features applied.
+int  SetFeaturesString(Face* face, const char* features);
+
+void ClearFeature(Face* face, const char* tag);
+void ClearAllFeatures(Face* face);
+
+int                   GetFeatureCount(const Face* face);
+const FeatureSetting* GetFeatures(const Face* face);   // valid until FreeFace()
+bool                  GetFeatureValue(const Face* face, const char* tag,
+                                      uint32_t* out_value);
+
+// ---------------------------------------------------------------------------
 // Axis control
 // ---------------------------------------------------------------------------
 
@@ -148,6 +194,9 @@ void  ApplyAxes(Face* face, bool allow_extrapolation = false);
 // ImGui widgets
 // ---------------------------------------------------------------------------
 
+// Draw one slider per axis (immediate-mode: call every frame). Returns true only
+// on the frame a slider changes, and calls ApplyAxes() for you on change — you
+// do not need a separate ApplyAxes() call when driving axes through this widget.
 // When allow_extrapolation=true each axis shows an unclamped DragFloat
 // (infinite drag + click to type). Values beyond the font's fvar range are
 // clamped for FreeType but extrapolated visually in AddText().
@@ -172,21 +221,21 @@ ImFont* SetImGuiFont(ImFontAtlas* atlas, Face* face, float size_pixels);
 //   pos                : top-left corner of the text block in screen coordinates
 //                        (baseline sits at pos.y + ascender * scale)
 //   col                : fill colour, e.g. IM_COL32(255, 255, 255, 255)
-//   outline            : when true, stroke each contour on top of the fill
+//   fill               : when true, fill glyph contours
+//   outline            : when true, stroke each contour (can combine with fill)
 //   outline_thickness  : stroke width in pixels (only used when outline is true)
 //   line_height_px     : vertical advance per newline; 0 = font default
 //   letter_spacing_px  : extra gap after each glyph except the last on a line; 0 = none
-//   hole_col           : fill colour for counter holes; 0 = skip hole punch
 //
 // Returns the total advance width of the rendered string in pixels.
 float AddText(ImDrawList* dl, Face* face,
               float em_px, ImVec2 pos,
               ImU32 col, const char* text,
+              bool fill = true,
               bool outline = false,
               float outline_thickness = 1.5f,
               float line_height_px = 0.f,
-              float letter_spacing_px = 0.f,
-              ImU32 hole_col = 0);
+              float letter_spacing_px = 0.f);
 
 // Measure total advance width without rendering (useful for centring).
 float CalcTextWidth(Face* face, float em_px, const char* text,
@@ -208,6 +257,24 @@ bool RasterizeText(Face* face, float em_px, const char* text, ImU32 col,
                    float line_height_px, float letter_spacing_px,
                    std::vector<uint8_t>& out_rgba,
                    int& out_w, int& out_h);
+
+// ---------------------------------------------------------------------------
+// Layout export (for plotter / ofPath integrations)
+// ---------------------------------------------------------------------------
+
+struct PlacedGlyph {
+    uint32_t glyph_index = 0;
+    float    x           = 0.f;
+    float    y           = 0.f;
+};
+
+// Lay out UTF-8 text and return pen positions in the same units as em_px.
+void LayoutGlyphs(Face* face, const char* text, float em_px,
+                  float line_height_px, float letter_spacing_px,
+                  std::vector<PlacedGlyph>& out);
+
+// Opaque access to the underlying FreeType face (cast to FT_Face in .cpp).
+void* GetFtFace(Face* face);
 
 // ---------------------------------------------------------------------------
 // Tag helpers

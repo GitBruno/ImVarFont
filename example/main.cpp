@@ -505,7 +505,6 @@ static void DrawPreview() {
         const float posY = center.y - textH * 0.5f + g_previewPan.y;
 
         ImU32 col = ImGui::ColorConvertFloat4ToU32(g_textColor);
-        ImU32 bgCol = ImGui::ColorConvertFloat4ToU32(g_bgColor);
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
         if (g_renderModeIdx == (int)ImVarFont::RenderMode::Raster) {
@@ -526,8 +525,8 @@ static void DrawPreview() {
             }
         } else {
             ImVarFont::AddText(dl, g_face, emPx, { posX, posY },
-                               col, g_text, g_outline,
-                               g_thickness * g_previewZoom, lineH, letterSp, bgCol);
+                               col, g_text, /*fill=*/true, g_outline,
+                               g_thickness * g_previewZoom, lineH, letterSp);
         }
     } else {
         const char* hint = "Drop a .ttf / .otf file here,  or enter its path and press Load";
@@ -619,6 +618,10 @@ int main(int /*argc*/, char** /*argv*/) {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
+    // Analytic GPU glyph renderer (signed-area coverage). Uses GLFW's GL loader.
+    if (!ImVarFont::InitRenderer((void* (*)(const char*))glfwGetProcAddress))
+        std::fprintf(stderr, "ImVarFont: GPU renderer init failed; using CPU fallback\n");
+
     rebuildUiFont();
 
     // ── Main loop ────────────────────────────────────────────────────────────
@@ -650,6 +653,7 @@ int main(int /*argc*/, char** /*argv*/) {
     }
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
+    ImVarFont::ShutdownRenderer();
     ImVarFont::FreeFace(g_face);
     freeRasterTexture();
     ImGui_ImplOpenGL3_Shutdown();

@@ -15,6 +15,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Freetype REQUIRED)
 find_package(OpenGL   REQUIRED)
 
+include(FetchContent)
+
 # HarfBuzz (GPOS/OpenType layout kerning) — optional but enabled when found
 find_package(PkgConfig QUIET)
 set(IMVARFONT_HARFBUZZ_FOUND FALSE)
@@ -24,8 +26,6 @@ if(PkgConfig_FOUND)
         set(IMVARFONT_HARFBUZZ_FOUND TRUE)
     endif()
 endif()
-
-include(FetchContent)
 
 # Dear ImGui  (docking branch – enables ImGuiDockspace for future use)
 FetchContent_Declare(imgui
@@ -81,6 +81,7 @@ target_link_libraries(imgui_impl PUBLIC glfw OpenGL::GL Freetype::Freetype)
 
 add_library(imvarfont STATIC
     imgui_var_font.cpp
+    imvarfont_gl.cpp
 )
 target_include_directories(imvarfont PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -89,6 +90,7 @@ target_include_directories(imvarfont PUBLIC
 target_link_libraries(imvarfont PUBLIC
     Freetype::Freetype
     imgui_impl
+    OpenGL::GL
 )
 if(IMVARFONT_HARFBUZZ_FOUND)
     target_compile_definitions(imvarfont PUBLIC IMVARFONT_USE_HARFBUZZ)

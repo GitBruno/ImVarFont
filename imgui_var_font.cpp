@@ -20,8 +20,13 @@
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <utility>
+#include <unordered_map>
 
 #ifdef IMVARFONT_USE_HARFBUZZ
 #include <hb.h>
@@ -32,6 +37,8 @@
 #ifdef IMGUI_ENABLE_FREETYPE
 #include "misc/freetype/imgui_freetype.h"
 #endif
+
+#include "imvarfont_gl.h"
 
 namespace ImVarFont {
 
@@ -55,6 +62,30 @@ struct FontMetadata {
     std::string uniqueId;
 };
 
+// ----------------------------------------------------------------------------
+// Curve-preserving glyph geometry (analytic renderer)
+//
+// Extracted once per (glyph, outlineGen) in RAW design units (FT_LOAD_NO_SCALE),
+// so it is fully scalable: the analytic coverage backend subdivides quadratics/
+// cubics to lines at the target device size on demand, and a future Loop-Blinn /
+// banding backend can consume the curves directly. Each segment carries its own
+// endpoints; FreeType contours are closed, so the segment soup is a set of
+// directed edges suitable for winding-correct coverage with no contour grouping.
+// ----------------------------------------------------------------------------
+enum class SegType : uint8_t { Line, Quad, Cubic };
+
+struct GlyphSeg {
+    SegType type;
+    ImVec2  p[4];  // Line: p[0..1]; Quad: p[0..2]; Cubic: p[0..3]
+};
+
+struct GlyphCurves {
+    std::vector<GlyphSeg> segs;
+    ImVec2 bboxMin {  1e30f,  1e30f };  // design-unit bounds (y-up)
+    ImVec2 bboxMax { -1e30f, -1e30f };
+    bool   empty() const { return segs.empty(); }
+};
+
 struct Face {
     FT_Library         library    = nullptr;
     FT_Face            ftFace     = nullptr;
@@ -70,9 +101,25 @@ struct Face {
     bool               useKerning      = true;
     bool               useHarfBuzz     = true;
     bool               useKernTable    = true;
+    std::vector<FeatureSetting> features;  // active OpenType GSUB/GPOS features
     RenderMode         renderMode      = RenderMode::Vector;
     HintingFlags       hintingFlags    = HintingFlags::Native;
     float              syncedEmPx      = -1.f;
+
+    // outlineGen is bumped whenever the outline shape changes (axes/mode/hinting),
+    // which invalidates every per-glyph cache below.
+    uint64_t                                outlineGen        = 0;
+
+    // Curve-preserving geometry cache for the analytic renderer. Size-independent
+    // (raw design units), keyed by glyph index, invalidated via curveCacheGen.
+    uint64_t                                curveCacheGen     = (uint64_t)-1;
+    std::unordered_map<FT_UInt, GlyphCurves> curveCache;
+
+    // GPU coverage textures, keyed by glyph index + device ppem + extrapolation
+    // bucket. Invalidated (textures deleted) whenever outlineGen changes.
+    uint64_t                                glyphTexCacheGen  = (uint64_t)-1;
+    std::unordered_map<uint64_t, glr::GlyphTex> glyphTexCache;
+
 #ifdef IMVARFONT_USE_HARFBUZZ
     hb_font_t*         hbFont          = nullptr;
     hb_buffer_t*       hbBuf           = nullptr;
@@ -311,6 +358,9 @@ void FreeFace(Face* face) {
         face->hbFont = nullptr;
     }
 #endif
+    for (auto& kv : face->glyphTexCache)
+        glr::Delete(kv.second.tex);
+    face->glyphTexCache.clear();
     if (face->ftFace)  FT_Done_Face(face->ftFace);
     if (face->library) FT_Done_FreeType(face->library);
     delete face;
@@ -365,6 +415,111 @@ void SetUseKernTable(Face* f, bool enabled) {
     if (!f) return;
     f->useKernTable = enabled && f->hasKerningTable;
 }
+
+// ----------------------------------------------------------------------------
+// OpenType features
+// ----------------------------------------------------------------------------
+
+static ImU32 tagFromString(const char* s) {
+    char t[4] = { ' ', ' ', ' ', ' ' };
+    for (int i = 0; i < 4 && s && s[i]; ++i) t[i] = s[i];
+    return MakeTag(t[0], t[1], t[2], t[3]);
+}
+
+void SetFeatureRange(Face* f, const char* tag, uint32_t value,
+                     uint32_t start, uint32_t end) {
+    if (!f || !tag) return;
+    const ImU32 t = tagFromString(tag);
+    for (auto& fs : f->features) {
+        if (fs.Tag == t) { fs.Value = value; fs.Start = start; fs.End = end; return; }
+    }
+    f->features.push_back(FeatureSetting{ t, value, start, end });
+}
+
+void SetFeature(Face* f, const char* tag, uint32_t value) {
+    SetFeatureRange(f, tag, value, 0u, 0xFFFFFFFFu);
+}
+
+void ClearFeature(Face* f, const char* tag) {
+    if (!f || !tag) return;
+    const ImU32 t = tagFromString(tag);
+    f->features.erase(
+        std::remove_if(f->features.begin(), f->features.end(),
+                       [t](const FeatureSetting& fs) { return fs.Tag == t; }),
+        f->features.end());
+}
+
+void ClearAllFeatures(Face* f) { if (f) f->features.clear(); }
+
+int GetFeatureCount(const Face* f) { return f ? (int)f->features.size() : 0; }
+
+const FeatureSetting* GetFeatures(const Face* f) {
+    return (f && !f->features.empty()) ? f->features.data() : nullptr;
+}
+
+bool GetFeatureValue(const Face* f, const char* tag, uint32_t* out_value) {
+    if (!f || !tag) return false;
+    const ImU32 t = tagFromString(tag);
+    for (const auto& fs : f->features) {
+        if (fs.Tag == t) { if (out_value) *out_value = fs.Value; return true; }
+    }
+    return false;
+}
+
+int SetFeaturesString(Face* f, const char* s) {
+    if (!f) return 0;
+    f->features.clear();
+    if (!s) return 0;
+    int n = 0;
+    const char* p = s;
+    while (*p) {
+        while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+        if (!*p) break;
+        uint32_t value = 1;
+        if (*p == '+') { value = 1; ++p; }
+        else if (*p == '-') { value = 0; ++p; }
+        char tag[5] = {0};
+        int ti = 0;
+        while (*p && *p != ',' && *p != ' ' && *p != '=' && *p != '\t') {
+            if (ti < 4) tag[ti++] = *p;
+            ++p;
+        }
+        if (*p == '=') {
+            ++p;
+            value = (uint32_t)strtoul(p, nullptr, 10);
+            while (*p && *p != ',' && *p != ' ' && *p != '\t') ++p;
+        }
+        if (ti > 0) { SetFeature(f, tag, value); ++n; }
+    }
+    return n;
+}
+
+#ifdef IMVARFONT_USE_HARFBUZZ
+// Convert the stored feature settings (plus the kerning master switch) into the
+// hb_feature_t array passed to hb_shape().
+static void buildHbFeatures(const Face* face, std::vector<hb_feature_t>& out) {
+    out.clear();
+    out.reserve(face->features.size() + 1);
+    for (const auto& fs : face->features) {
+        char t[5]; TagToStr(fs.Tag, t);
+        hb_feature_t hf;
+        hf.tag   = HB_TAG(t[0], t[1], t[2], t[3]);
+        hf.value = fs.Value;
+        hf.start = fs.Start;
+        hf.end   = fs.End;
+        out.push_back(hf);
+    }
+    // Respect the kerning master switch by explicitly disabling GPOS 'kern'.
+    if (!face->useKerning) {
+        hb_feature_t kf;
+        kf.tag = HB_TAG('k','e','r','n');
+        kf.value = 0;
+        kf.start = 0;
+        kf.end   = 0xFFFFFFFFu;
+        out.push_back(kf);
+    }
+}
+#endif
 
 RenderMode GetRenderMode(const Face* face) {
     return face ? face->renderMode : RenderMode::Vector;
@@ -463,6 +618,7 @@ void ApplyAxes(Face* f, bool allow_extrapolation) {
                                    coords.data());
 
     f->syncedEmPx = -1.f;
+    ++f->outlineGen;   // outline shape changed → invalidate glyph fill cache
 
 #ifdef IMVARFONT_USE_HARFBUZZ
     if (f->hbFont)
@@ -556,9 +712,9 @@ void MetadataTable(const Face* face) {
     ImGui::Text("Desc   : %d", ft->descender);
     ImGui::Text("Height : %d", ft->height);
     if (ft->bbox.xMin || ft->bbox.yMin || ft->bbox.xMax || ft->bbox.yMax) {
-        ImGui::Text("BBox   : %d %d  %d %d",
-                    ft->bbox.xMin, ft->bbox.yMin,
-                    ft->bbox.xMax, ft->bbox.yMax);
+        ImGui::Text("BBox   : %ld %ld  %ld %ld",
+                    (long)ft->bbox.xMin, (long)ft->bbox.yMin,
+                    (long)ft->bbox.xMax, (long)ft->bbox.yMax);
     }
 
     if (!m.copyright.empty() || !m.designer.empty() || !m.manufacturer.empty() ||
@@ -642,192 +798,288 @@ void MetadataTable(const Face* face) {
 // Outline decomposition → ImDrawList
 // ============================================================================
 
-// Signed area helpers for contour winding (font space, y-up).
-// Curves are flattened so winding is reliable regardless of contour order.
-static void addSegArea(double& acc, double x0, double y0, double x1, double y1) {
-    acc += x0 * y1 - x1 * y0;
+static ImVec2 outlineToScreen(float originX, float originY,
+                              float scale, float scaleX, float scaleY,
+                              const FT_Vector& v) {
+    const float px = originX + (float)v.x * scale;
+    const float py = originY - (float)v.y * scale;  // FT y-up → screen y-down
+    return { originX + (px - originX) * scaleX,
+             originY + (py - originY) * scaleY };
 }
 
-static void flattenQuadArea(double& cx, double& cy, double& acc,
-                            double x1, double y1, double x2, double y2, int depth) {
-    if (depth <= 0) {
-        addSegArea(acc, cx, cy, x2, y2);
-        cx = x2;
-        cy = y2;
-        return;
+
+// ============================================================================
+// Analytic GPU glyph fill (signed-area coverage)
+//
+// Curve-preserving extraction (design units, cached per glyph for the vector
+// pipeline) is flattened to line edges at the target DEVICE resolution and
+// handed to the GL coverage backend, which accumulates winding-correct,
+// conflation-free coverage and resolves it to an RGBA8 cell. The cell is
+// composited with ImGui::AddImage tinted by the text colour, so counters,
+// curves and stems stay faithful at any zoom and DPI.
+// ============================================================================
+namespace {
+
+struct CurveExtractCtx {
+    GlyphCurves* g     = nullptr;
+    ImVec2       cur   {};
+    ImVec2       start {};
+    bool         open  = false;
+
+    void ext(const ImVec2& p) {
+        if (p.x < g->bboxMin.x) g->bboxMin.x = p.x;
+        if (p.y < g->bboxMin.y) g->bboxMin.y = p.y;
+        if (p.x > g->bboxMax.x) g->bboxMax.x = p.x;
+        if (p.y > g->bboxMax.y) g->bboxMax.y = p.y;
     }
-    const double mx = (cx + 2.0 * x1 + x2) * 0.25;
-    const double my = (cy + 2.0 * y1 + y2) * 0.25;
-    flattenQuadArea(cx, cy, acc, (cx + x1) * 0.5, (cy + y1) * 0.5, mx, my, depth - 1);
-    flattenQuadArea(cx, cy, acc, (x1 + x2) * 0.5, (y1 + y2) * 0.5, x2, y2, depth - 1);
-}
-
-static void flattenCubicArea(double& cx, double& cy, double& acc,
-                             double x1, double y1, double x2, double y2,
-                             double x3, double y3, int depth) {
-    if (depth <= 0) {
-        addSegArea(acc, cx, cy, x3, y3);
-        cx = x3;
-        cy = y3;
-        return;
-    }
-    const double x01 = (cx + x1) * 0.5,  y01 = (cy + y1) * 0.5;
-    const double x12 = (x1 + x2) * 0.5,  y12 = (y1 + y2) * 0.5;
-    const double x23 = (x2 + x3) * 0.5,  y23 = (y2 + y3) * 0.5;
-    const double x012 = (x01 + x12) * 0.5, y012 = (y01 + y12) * 0.5;
-    const double x123 = (x12 + x23) * 0.5, y123 = (y12 + y23) * 0.5;
-    const double mx = (x012 + x123) * 0.5, my = (y012 + y123) * 0.5;
-    flattenCubicArea(cx, cy, acc, x01, y01, x012, y012, mx, my, depth - 1);
-    flattenCubicArea(cx, cy, acc, x123, y123, x23, y23, x3, y3, depth - 1);
-}
-
-struct ContourAreasCtx {
-    std::vector<double> areas;
-    int   contourIdx = -1;
-    double cx = 0.0, cy = 0.0;
-    double fx = 0.0, fy = 0.0;
-    bool  open = false;
-
     void closeContour() {
-        if (!open || contourIdx < 0 || contourIdx >= (int)areas.size())
-            return;
-        addSegArea(areas[contourIdx], cx, cy, fx, fy);
+        if (!open) return;
+        if (cur.x != start.x || cur.y != start.y) {
+            GlyphSeg s; s.type = SegType::Line; s.p[0] = cur; s.p[1] = start;
+            g->segs.push_back(s);
+        }
         open = false;
     }
 };
 
-static int area_moveto(const FT_Vector* to, void* user) {
-    auto& c = *static_cast<ContourAreasCtx*>(user);
+static inline ImVec2 ftVec(const FT_Vector* v) { return ImVec2((float)v->x, (float)v->y); }
+
+static int cx_moveto(const FT_Vector* to, void* u) {
+    auto& c = *static_cast<CurveExtractCtx*>(u);
     c.closeContour();
-    ++c.contourIdx;
-    c.cx = (double)to->x;
-    c.cy = (double)to->y;
-    c.fx = c.cx;
-    c.fy = c.cy;
+    c.cur = c.start = ftVec(to);
+    c.ext(c.cur);
     c.open = true;
     return 0;
 }
-
-static int area_lineto(const FT_Vector* to, void* user) {
-    auto& c = *static_cast<ContourAreasCtx*>(user);
-    if (!c.open || c.contourIdx < 0) return 0;
-    addSegArea(c.areas[c.contourIdx], c.cx, c.cy, (double)to->x, (double)to->y);
-    c.cx = (double)to->x;
-    c.cy = (double)to->y;
+static int cx_lineto(const FT_Vector* to, void* u) {
+    auto& c = *static_cast<CurveExtractCtx*>(u);
+    if (!c.open) return 0;
+    const ImVec2 p = ftVec(to);
+    GlyphSeg s; s.type = SegType::Line; s.p[0] = c.cur; s.p[1] = p;
+    c.g->segs.push_back(s);
+    c.cur = p; c.ext(p);
     return 0;
 }
-
-static int area_conicto(const FT_Vector* ctrl, const FT_Vector* to, void* user) {
-    auto& c = *static_cast<ContourAreasCtx*>(user);
-    if (!c.open || c.contourIdx < 0) return 0;
-    flattenQuadArea(c.cx, c.cy, c.areas[c.contourIdx],
-                    (double)ctrl->x, (double)ctrl->y,
-                    (double)to->x, (double)to->y, 8);
+static int cx_conicto(const FT_Vector* ctrl, const FT_Vector* to, void* u) {
+    auto& c = *static_cast<CurveExtractCtx*>(u);
+    if (!c.open) return 0;
+    const ImVec2 k = ftVec(ctrl), p = ftVec(to);
+    GlyphSeg s; s.type = SegType::Quad; s.p[0] = c.cur; s.p[1] = k; s.p[2] = p;
+    c.g->segs.push_back(s);
+    c.cur = p; c.ext(k); c.ext(p);
     return 0;
 }
-
-static int area_cubicto(const FT_Vector* c1, const FT_Vector* c2,
-                         const FT_Vector* to, void* user) {
-    auto& c = *static_cast<ContourAreasCtx*>(user);
-    if (!c.open || c.contourIdx < 0) return 0;
-    flattenCubicArea(c.cx, c.cy, c.areas[c.contourIdx],
-                     (double)c1->x, (double)c1->y,
-                     (double)c2->x, (double)c2->y,
-                     (double)to->x, (double)to->y, 8);
+static int cx_cubicto(const FT_Vector* c1, const FT_Vector* c2,
+                      const FT_Vector* to, void* u) {
+    auto& c = *static_cast<CurveExtractCtx*>(u);
+    if (!c.open) return 0;
+    const ImVec2 a = ftVec(c1), b = ftVec(c2), p = ftVec(to);
+    GlyphSeg s; s.type = SegType::Cubic; s.p[0] = c.cur; s.p[1] = a; s.p[2] = b; s.p[3] = p;
+    c.g->segs.push_back(s);
+    c.cur = p; c.ext(a); c.ext(b); c.ext(p);
     return 0;
 }
-
-static const FT_Outline_Funcs kAreaFuncs = {
-    area_moveto, area_lineto, area_conicto, area_cubicto, 0, 0
+static const FT_Outline_Funcs kCurveExtractFuncs = {
+    cx_moveto, cx_lineto, cx_conicto, cx_cubicto, 0, 0
 };
 
-static bool cffSfntOutlines(FT_Face face) {
-    if (!face || !FT_IS_SFNT(face)) return false;
-    FT_ULong len = 0;
-    if (FT_Load_Sfnt_Table(face, FT_MAKE_TAG('C', 'F', 'F', ' '), 0, nullptr, &len) == 0
-        && len > 0)
-        return true;
-    len = 0;
-    if (FT_Load_Sfnt_Table(face, FT_MAKE_TAG('C', 'F', 'F', '2'), 0, nullptr, &len) == 0
-        && len > 0)
-        return true;
-    return false;
+static void extractCurves(const FT_Outline* ol, GlyphCurves& out) {
+    out.segs.clear();
+    out.bboxMin = ImVec2( 1e30f,  1e30f);
+    out.bboxMax = ImVec2(-1e30f, -1e30f);
+    CurveExtractCtx ctx; ctx.g = &out;
+    FT_Outline_Decompose(const_cast<FT_Outline*>(ol), &kCurveExtractFuncs, &ctx);
+    ctx.closeContour();
 }
 
-// TrueType glyf: outer contours are clockwise (negative area, y-up).
-// CFF / PostScript: outer contours are counter-clockwise (positive area).
-// Contour order in the glyph does not matter.
-static bool contourIsFilledOuter(FT_Face face, const FT_Outline* ol, double signedArea) {
-    if (std::fabs(signedArea) < 1e-3) return true;
-    const bool cff     = cffSfntOutlines(face);
-    const bool reverse = (ol->flags & FT_OUTLINE_REVERSE_FILL) != 0;
-    bool fill = cff ? (signedArea > 0.0) : (signedArea < 0.0);
-    return reverse ? !fill : fill;
-}
-
-static void computeContourFillMask(FT_Face face, const FT_Outline* ol,
-                                   std::vector<bool>& out_fill_outer) {
-    out_fill_outer.assign(ol->n_contours, true);
-    if (ol->n_contours <= 0) return;
-
-    ContourAreasCtx ac;
-    ac.areas.assign(ol->n_contours, 0.0);
-    FT_Outline_Decompose(const_cast<FT_Outline*>(ol), &kAreaFuncs, &ac);
-    ac.closeContour();
-
-    for (int i = 0; i < ol->n_contours; ++i) {
-        const double area = ac.areas[i] * 0.5;
-        out_fill_outer[i] = contourIsFilledOuter(face, ol, area);
+// Cached design-unit curves (vector pipeline; size-independent). Invalidated by
+// outlineGen. Hinted outlines are size-specific and are extracted fresh instead.
+static const GlyphCurves& getCurvesCached(Face* face, FT_UInt gi, const FT_Outline* ol) {
+    if (face->curveCacheGen != face->outlineGen) {
+        face->curveCache.clear();
+        face->curveCacheGen = face->outlineGen;
     }
+    auto it = face->curveCache.find(gi);
+    if (it != face->curveCache.end())
+        return it->second;
+    GlyphCurves gc;
+    extractCurves(ol, gc);
+    return face->curveCache.emplace(gi, std::move(gc)).first->second;
 }
 
-struct OutlineCtx {
-    ImDrawList*   dl;
-    int           contourIdx;
-    float         scale;     // design-units → screen pixels
-    float         scaleX;    // synthetic extrap stretch (horizontal)
-    float         scaleY;    // synthetic extrap stretch (vertical)
-    float         originX;   // glyph pen origin in screen space
-    float         originY;   // baseline in screen space
-    ImVec2        cur;       // current pen tip (screen coords), needed for quad→cubic
-    ImVec2        pathFirst; // first point of the active contour
-    ImU32         col;
-    ImU32         holeCol;
-    bool          filled;
-    bool          outerPass;   // true = fill outer contours; false = punch holes
-    bool          strokeOutline;
-    float         thickness;
-    bool          pathOpen;    // true when a contour is being built
-    bool          pathStarted; // true after the first point is added to _Path
-    const std::vector<bool>* contourFillOuter = nullptr;
+static inline ImVec2 segMid(const ImVec2& a, const ImVec2& b) {
+    return ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+}
+static inline void pushEdge(std::vector<float>& E, const ImVec2& a, const ImVec2& b) {
+    E.push_back(a.x); E.push_back(a.y); E.push_back(b.x); E.push_back(b.y);
+}
+
+// Adaptive flattening in cell-pixel space (tolSq = chord-deviation² in px²).
+static void flatQuad(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2,
+                     float tolSq, int depth) {
+    const float dx = p2.x - p0.x, dy = p2.y - p0.y;
+    const float cross = (p1.x - p2.x) * dy - (p1.y - p2.y) * dx;
+    const float len2  = dx * dx + dy * dy;
+    if (depth >= 18 || (len2 > 1e-12f ? (cross * cross <= tolSq * len2)
+                                      : (((p1.x - p0.x) * (p1.x - p0.x) +
+                                          (p1.y - p0.y) * (p1.y - p0.y)) <= tolSq))) {
+        pushEdge(E, p0, p2);
+        return;
+    }
+    const ImVec2 p01 = segMid(p0, p1), p12 = segMid(p1, p2), p012 = segMid(p01, p12);
+    flatQuad(E, p0, p01, p012, tolSq, depth + 1);
+    flatQuad(E, p012, p12, p2, tolSq, depth + 1);
+}
+static void flatCubic(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2, ImVec2 p3,
+                      float tolSq, int depth) {
+    const float dx = p3.x - p0.x, dy = p3.y - p0.y;
+    const float d1 = std::fabs((p1.x - p3.x) * dy - (p1.y - p3.y) * dx);
+    const float d2 = std::fabs((p2.x - p3.x) * dy - (p2.y - p3.y) * dx);
+    const float len2 = dx * dx + dy * dy;
+    const float dd = d1 + d2;
+    if (depth >= 18 || (len2 > 1e-12f ? (dd * dd <= tolSq * len2)
+                                      : (((p1.x - p0.x) * (p1.x - p0.x) +
+                                          (p1.y - p0.y) * (p1.y - p0.y)) <= tolSq))) {
+        pushEdge(E, p0, p3);
+        return;
+    }
+    const ImVec2 p01 = segMid(p0, p1), p12 = segMid(p1, p2), p23 = segMid(p2, p3);
+    const ImVec2 p012 = segMid(p01, p12), p123 = segMid(p12, p23);
+    const ImVec2 p0123 = segMid(p012, p123);
+    flatCubic(E, p0, p01, p012, p0123, tolSq, depth + 1);
+    flatCubic(E, p0123, p123, p23, p3, tolSq, depth + 1);
+}
+
+static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
+                              const FT_Outline* ol, bool hinted, float em_px,
+                              float originX, float originY,
+                              float scale, float extrapX, float extrapY, ImU32 col) {
+    if (!glr::Ready())
+        return;
+
+    const ImVec2 fbScaleVec = ImGui::GetIO().DisplayFramebufferScale;
+    const float  fbScale    = (fbScaleVec.y > 0.f) ? fbScaleVec.y : 1.f;
+
+    GlyphCurves tmp;
+    const GlyphCurves& gc = hinted ? (extractCurves(ol, tmp), tmp)
+                                   : getCurvesCached(face, gi, ol);
+    if (gc.empty())
+        return;
+
+    const float bx0 = gc.bboxMin.x, by0 = gc.bboxMin.y;
+    const float bx1 = gc.bboxMax.x, by1 = gc.bboxMax.y;
+    if (bx1 <= bx0 || by1 <= by0)
+        return;
+
+    // device-pixel transform (cell space, y-down)
+    const float sx = scale * extrapX * fbScale;
+    const float sy = scale * extrapY * fbScale;
+    if (sx <= 0.f || sy <= 0.f)
+        return;
+
+    const int   pad   = 2;
+    const float gwDev = (bx1 - bx0) * sx;
+    const float ghDev = (by1 - by0) * sy;
+    const int   w     = (int)std::ceil(gwDev) + 2 * pad;
+    const int   h     = (int)std::ceil(ghDev) + 2 * pad;
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
+        return;
+
+    if (face->glyphTexCacheGen != face->outlineGen) {
+        for (auto& kv : face->glyphTexCache)
+            glr::Delete(kv.second.tex);
+        face->glyphTexCache.clear();
+        face->glyphTexCacheGen = face->outlineGen;
+    }
+
+    const uint32_t emQ = (uint32_t)(em_px * fbScale * 4.f + 0.5f);
+    const uint32_t exQ = (uint32_t)(extrapX * 256.f + 0.5f);
+    const uint32_t eyQ = (uint32_t)(extrapY * 256.f + 0.5f);
+    const uint64_t key = ((uint64_t)gi << 32) ^ ((uint64_t)emQ << 8) ^
+                         (uint64_t)(exQ * 2654435761u ^ (eyQ * 40503u));
+
+    glr::GlyphTex tex;
+    auto it = face->glyphTexCache.find(key);
+    if (it != face->glyphTexCache.end()) {
+        tex = it->second;
+    } else {
+        std::vector<float> E;
+        E.reserve(gc.segs.size() * 4);
+        const float tolSq = 0.18f * 0.18f;
+        for (const GlyphSeg& s : gc.segs) {
+            ImVec2 P[4];
+            const int n = (s.type == SegType::Line) ? 2
+                        : (s.type == SegType::Quad) ? 3 : 4;
+            for (int i = 0; i < n; ++i) {
+                P[i].x = (float)pad + (s.p[i].x - bx0) * sx;
+                P[i].y = (float)pad + (by1 - s.p[i].y) * sy;
+            }
+            if (s.type == SegType::Line)      pushEdge(E, P[0], P[1]);
+            else if (s.type == SegType::Quad) flatQuad(E, P[0], P[1], P[2], tolSq, 0);
+            else                              flatCubic(E, P[0], P[1], P[2], P[3], tolSq, 0);
+        }
+        if (E.empty())
+            return;
+        tex = glr::RenderGlyph(E.data(), (int)(E.size() / 4), w, h, 1.0f);
+        face->glyphTexCache[key] = tex;
+    }
+    if (!tex.valid)
+        return;
+
+    // Place the device cell back into logical screen space. A design point
+    // (nx,ny) maps to screen (originX + nx*scale*extrapX, originY - ny*scale*extrapY).
+    const float sxl     = scale * extrapX;
+    const float syl     = scale * extrapY;
+    const float scrXmin = originX + bx0 * sxl;        // left  (min x)
+    const float scrYmin = originY - by1 * syl;        // top   (max y)
+    const ImVec2 pmin(scrXmin - (float)pad / fbScale, scrYmin - (float)pad / fbScale);
+    const ImVec2 pmax(pmin.x + (float)w / fbScale,    pmin.y + (float)h / fbScale);
+
+    // Coverage texture is bottom-up, so flip V when compositing.
+    dl->AddImage((ImTextureID)(intptr_t)tex.tex, pmin, pmax,
+                 ImVec2(0.f, 1.f), ImVec2(1.f, 0.f), col);
+}
+
+} // namespace
+
+bool InitRenderer(void* (*gl_get_proc_address)(const char*)) {
+    return glr::Init((glr::GLProc)gl_get_proc_address);
+}
+void ShutdownRenderer() {
+    glr::Shutdown();
+}
+bool RendererReady() {
+    return glr::Ready();
+}
+
+struct StrokeOutlineCtx {
+    ImDrawList* dl          = nullptr;
+    float       scale       = 1.f;
+    float       scaleX      = 1.f;
+    float       scaleY      = 1.f;
+    float       originX     = 0.f;
+    float       originY     = 0.f;
+    ImVec2      cur         {};
+    ImVec2      pathFirst   {};
+    ImU32       col         = 0;
+    float       thickness   = 1.f;
+    bool        pathOpen    = false;
+    bool        pathStarted = false;
 
     ImVec2 toScreen(const FT_Vector& v) const {
-        const float px = originX + (float)v.x * scale;
-        const float py = originY - (float)v.y * scale;  // FT y-up → screen y-down
-        return { originX + (px - originX) * scaleX,
-                 originY + (py - originY) * scaleY };
+        return outlineToScreen(originX, originY, scale, scaleX, scaleY, v);
     }
 
     void flushPath() {
         if (!pathOpen)
             return;
         if (pathStarted) {
-            // Close the contour explicitly instead of ImDrawFlags_Closed, which
-            // can draw a stray chord when the first/last points don't coincide.
             const float dx = pathFirst.x - cur.x;
             const float dy = pathFirst.y - cur.y;
             if (dx * dx + dy * dy > 0.25f)
                 dl->PathLineTo(pathFirst);
-            if (filled && contourFillOuter && contourIdx >= 0
-                && contourIdx < (int)contourFillOuter->size()) {
-                const bool isOuter = (*contourFillOuter)[contourIdx];
-                if (outerPass && isOuter)
-                    dl->PathFillConcave(col);
-                else if (!outerPass && !isOuter && holeCol != 0)
-                    dl->PathFillConcave(holeCol);
-            }
-            if (strokeOutline)
-                dl->PathStroke(col, thickness, ImDrawFlags_Closed);
+            dl->PathStroke(col, thickness, ImDrawFlags_Closed);
         } else {
             dl->PathClear();
         }
@@ -844,10 +1096,9 @@ struct OutlineCtx {
     }
 };
 
-static int outline_moveto(const FT_Vector* to, void* user) {
-    auto& c = *static_cast<OutlineCtx*>(user);
+static int stroke_moveto(const FT_Vector* to, void* user) {
+    auto& c = *static_cast<StrokeOutlineCtx*>(user);
     c.flushPath();
-    ++c.contourIdx;
     c.cur         = c.toScreen(*to);
     c.dl->PathClear();
     c.pathOpen    = true;
@@ -855,20 +1106,16 @@ static int outline_moveto(const FT_Vector* to, void* user) {
     return 0;
 }
 
-static int outline_lineto(const FT_Vector* to, void* user) {
-    auto& c = *static_cast<OutlineCtx*>(user);
+static int stroke_lineto(const FT_Vector* to, void* user) {
+    auto& c = *static_cast<StrokeOutlineCtx*>(user);
     c.ensurePathStarted();
     c.cur = c.toScreen(*to);
     c.dl->PathLineTo(c.cur);
     return 0;
 }
 
-// FreeType conic_to = quadratic Bézier (P0=cur, P1=ctrl, P2=to).
-// ImDrawList only has cubic Béziers, so we upgrade via:
-//   cp1 = P0 + 2/3 * (P1 - P0)
-//   cp2 = P2 + 2/3 * (P1 - P2)
-static int outline_conicto(const FT_Vector* ctrl, const FT_Vector* to, void* user) {
-    auto& c = *static_cast<OutlineCtx*>(user);
+static int stroke_conicto(const FT_Vector* ctrl, const FT_Vector* to, void* user) {
+    auto& c = *static_cast<StrokeOutlineCtx*>(user);
     c.ensurePathStarted();
     const ImVec2 p1 = c.toScreen(*ctrl);
     const ImVec2 p2 = c.toScreen(*to);
@@ -882,10 +1129,9 @@ static int outline_conicto(const FT_Vector* ctrl, const FT_Vector* to, void* use
     return 0;
 }
 
-// FreeType cubic_to maps directly to ImDrawList cubic Bézier.
-static int outline_cubicto(const FT_Vector* c1, const FT_Vector* c2,
-                            const FT_Vector* to, void* user) {
-    auto& c = *static_cast<OutlineCtx*>(user);
+static int stroke_cubicto(const FT_Vector* c1, const FT_Vector* c2,
+                          const FT_Vector* to, void* user) {
+    auto& c = *static_cast<StrokeOutlineCtx*>(user);
     c.ensurePathStarted();
     const ImVec2 p2 = c.toScreen(*to);
     c.dl->PathBezierCubicCurveTo(c.toScreen(*c1), c.toScreen(*c2), p2);
@@ -893,10 +1139,16 @@ static int outline_cubicto(const FT_Vector* c1, const FT_Vector* c2,
     return 0;
 }
 
-static const FT_Outline_Funcs kOutlineFuncs = {
-    outline_moveto, outline_lineto, outline_conicto, outline_cubicto,
-    0, 0
+static const FT_Outline_Funcs kStrokeOutlineFuncs = {
+    stroke_moveto, stroke_lineto, stroke_conicto, stroke_cubicto, 0, 0
 };
+
+static void decomposeStrokeOutline(StrokeOutlineCtx& ctx, const FT_Outline* ol) {
+    ctx.pathOpen    = false;
+    ctx.pathStarted = false;
+    FT_Outline_Decompose(const_cast<FT_Outline*>(ol), &kStrokeOutlineFuncs, &ctx);
+    ctx.flushPath();
+}
 
 // ============================================================================
 // Glyph load / metrics (vector vs hinted pipeline)
@@ -951,6 +1203,7 @@ void SetRenderMode(Face* face, RenderMode mode) {
     if (!face) return;
     face->renderMode = mode;
     face->syncedEmPx = -1.f;
+    ++face->outlineGen;
 #ifdef IMVARFONT_USE_HARFBUZZ
     if (face->hbFont)
         hb_ft_font_set_load_flags(face->hbFont, buildHbLoadFlags(face));
@@ -961,6 +1214,7 @@ void SetHintingFlags(Face* face, HintingFlags flags) {
     if (!face) return;
     face->hintingFlags = flags;
     face->syncedEmPx = -1.f;
+    ++face->outlineGen;
 #ifdef IMVARFONT_USE_HARFBUZZ
     if (face->hbFont)
         hb_ft_font_set_load_flags(face->hbFont, buildHbLoadFlags(face));
@@ -1092,19 +1346,10 @@ static float hbBufferPosPx(float v26_6, float extrap) {
     return v26_6 / 64.f * extrap;
 }
 
-static void decomposeOutline(OutlineCtx& ctx, const FT_Outline* ol) {
-    ctx.contourIdx    = -1;
-    ctx.pathOpen      = false;
-    ctx.pathStarted   = false;
-    ctx.cur           = { ctx.originX, ctx.originY };
-    FT_Outline_Decompose(const_cast<FT_Outline*>(ol), &kOutlineFuncs, &ctx);
-    ctx.flushPath();
-}
-
 static float renderGlyphByIndex(ImDrawList* dl, Face* face, FT_UInt gi,
                                 const GlyphMetricsCtx& gctx,
                                 float origin_x, float origin_y,
-                                ImU32 col, ImU32 hole_col,
+                                ImU32 col,
                                 bool filled, bool strokeOutline,
                                 float thickness)
 {
@@ -1129,41 +1374,25 @@ static float renderGlyphByIndex(ImDrawList* dl, Face* face, FT_UInt gi,
 
     const FT_Outline* ol = &ft->glyph->outline;
 
-    OutlineCtx ctx;
-    ctx.dl            = dl;
-    ctx.scale         = gctx.outline_scale;
-    ctx.scaleX        = extrapX;
-    ctx.scaleY        = extrapY;
-    ctx.originX       = origin_x;
-    ctx.originY       = origin_y;
-    ctx.col           = col;
-    ctx.holeCol       = hole_col;
-    ctx.filled        = filled;
-    ctx.outerPass     = true;
-    ctx.strokeOutline = strokeOutline;
-    ctx.thickness     = thickness;
-
-    std::vector<bool> fillOuter;
-    if (filled && ol->n_contours > 0) {
-        computeContourFillMask(ft, ol, fillOuter);
-        ctx.contourFillOuter = &fillOuter;
-
-        ctx.filled        = true;
-        ctx.strokeOutline = false;
-        ctx.outerPass     = true;
-        decomposeOutline(ctx, ol);
-
-        if (hole_col != 0 && ol->n_contours > 1) {
-            ctx.outerPass = false;
-            decomposeOutline(ctx, ol);
-        }
-    }
+    // Glyph fill uses the analytic GPU coverage renderer (signed-area, non-zero
+    // winding) for faithful counters and conflation-free anti-aliasing. Requires
+    // InitRenderer() to have succeeded; otherwise filled text is skipped.
+    if (filled)
+        fillGlyphAnalytic(dl, face, gi, ol, gctx.hinted, gctx.em_px,
+                          origin_x, origin_y,
+                          gctx.outline_scale, extrapX, extrapY, col);
 
     if (strokeOutline) {
-        ctx.filled            = false;
-        ctx.strokeOutline     = true;
-        ctx.contourFillOuter  = nullptr;
-        decomposeOutline(ctx, ol);
+        StrokeOutlineCtx ctx;
+        ctx.dl          = dl;
+        ctx.scale       = gctx.outline_scale;
+        ctx.scaleX      = extrapX;
+        ctx.scaleY      = extrapY;
+        ctx.originX     = origin_x;
+        ctx.originY     = origin_y;
+        ctx.col         = col;
+        ctx.thickness   = thickness;
+        decomposeStrokeOutline(ctx, ol);
     }
 
     return adv;
@@ -1173,13 +1402,13 @@ static float renderGlyph(ImDrawList* dl, Face* face,
                           unsigned int codepoint,
                           const GlyphMetricsCtx& gctx,
                           float origin_x, float origin_y,
-                          ImU32 col, ImU32 hole_col,
+                          ImU32 col,
                           bool filled, bool strokeOutline,
                           float thickness)
 {
     FT_Face ft = face->ftFace;
     const FT_UInt gi = FT_Get_Char_Index(ft, (FT_ULong)codepoint);
-    return renderGlyphByIndex(dl, face, gi, gctx, origin_x, origin_y, col, hole_col,
+    return renderGlyphByIndex(dl, face, gi, gctx, origin_x, origin_y, col,
                               filled, strokeOutline, thickness);
 }
 
@@ -1255,9 +1484,10 @@ static float renderGlyphBitmap(Face* face, FT_UInt gi, const GlyphMetricsCtx& gc
 // Draw, measure, or rasterize one line.
 static float drawTextLine(Face* face, const char* line, int line_len,
                           float em_px, float pen_x, float base_y,
-                          ImDrawList* dl, ImU32 col, ImU32 hole_col,
+                          ImDrawList* dl, ImU32 col,
                           bool filled, bool strokeOutline, float thickness,
                           float letter_spacing_px,
+                          std::vector<PlacedGlyph>* layout_out = nullptr,
                           std::vector<uint8_t>* raster_rgba = nullptr,
                           int raster_w = 0, int raster_h = 0)
 {
@@ -1272,15 +1502,21 @@ static float drawTextLine(Face* face, const char* line, int line_len,
     computeExtrapScale(face, &extrapX, &extrapY);
 
 #ifdef IMVARFONT_USE_HARFBUZZ
-    if (face->useKerning && face->useHarfBuzz && face->hasGpos
-        && face->hbFont && face->hbBuf) {
+    // Shape with HarfBuzz when it can contribute: GPOS positioning (kerning) or
+    // any active OpenType feature (which may substitute glyphs via GSUB).
+    const bool hbForPositioning = face->useKerning && face->useHarfBuzz && face->hasGpos;
+    const bool hbForFeatures    = !face->features.empty();
+    if ((hbForPositioning || hbForFeatures) && face->hbFont && face->hbBuf) {
         syncHbFontSize(face, em_px);
 
         hb_buffer_t* buf = face->hbBuf;
         hb_buffer_clear_contents(buf);
         hb_buffer_add_utf8(buf, line, line_len, 0, line_len);
         hb_buffer_guess_segment_properties(buf);
-        hb_shape(face->hbFont, buf, nullptr, 0);
+        std::vector<hb_feature_t> feats;
+        buildHbFeatures(face, feats);
+        hb_shape(face->hbFont, buf, feats.empty() ? nullptr : feats.data(),
+                 (unsigned)feats.size());
 
         unsigned count = hb_buffer_get_length(buf);
         if (count > 0) {
@@ -1295,11 +1531,13 @@ static float drawTextLine(Face* face, const char* line, int line_len,
                     const float gx    = pen_x + x_off;
                     const float gy    = base_y - y_off;
 
-                    if (raster)
+                    if (layout_out)
+                        layout_out->push_back({ gid, gx, gy });
+                    else if (raster)
                         renderGlyphBitmap(face, gid, gctx, gx, gy, col,
                                           *raster_rgba, raster_w, raster_h);
                     else if (dl)
-                        renderGlyphByIndex(dl, face, gid, gctx, gx, gy, col, hole_col,
+                        renderGlyphByIndex(dl, face, gid, gctx, gx, gy, col,
                                              filled, strokeOutline, thickness);
 
                     const float hb_adv = hbBufferPosPx((float)pos[i].x_advance, extrapX);
@@ -1328,11 +1566,14 @@ static float drawTextLine(Face* face, const char* line, int line_len,
         if (prev_gi != 0 && face->hasKerningTable && face->useKerning && face->useKernTable)
             pen_x += kerningPx(face, ft, prev_gi, gi, gctx);
 
+        if (layout_out)
+            layout_out->push_back({ gi, pen_x, base_y });
+
         if (raster)
             pen_x += renderGlyphBitmap(face, gi, gctx, pen_x, base_y, col,
                                        *raster_rgba, raster_w, raster_h);
         else if (dl)
-            pen_x += renderGlyphByIndex(dl, face, gi, gctx, pen_x, base_y, col, hole_col,
+            pen_x += renderGlyphByIndex(dl, face, gi, gctx, pen_x, base_y, col,
                                         filled, strokeOutline, thickness);
         else
             pen_x += glyphAdvancePx(face, ft, gi, gctx);
@@ -1347,7 +1588,7 @@ static float drawTextLine(Face* face, const char* line, int line_len,
 
 static float addTextLayout(ImDrawList* dl, Face* face,
                            float em_px, ImVec2 pos,
-                           ImU32 col, ImU32 hole_col, const char* text,
+                           ImU32 col, const char* text,
                            bool filled, bool strokeOutline, float thickness,
                            float line_height_px, float letter_spacing_px)
 {
@@ -1365,7 +1606,7 @@ static float addTextLayout(ImDrawList* dl, Face* face,
             const int line_len = (int)(p - line_start);
             if (line_len > 0) {
                 const float w = drawTextLine(face, line_start, line_len, em_px,
-                                            pos.x, base_y, dl, col, hole_col,
+                                            pos.x, base_y, dl, col,
                                             filled, strokeOutline, thickness,
                                             letter_spacing_px);
                 if (w > max_w) max_w = w;
@@ -1378,6 +1619,42 @@ static float addTextLayout(ImDrawList* dl, Face* face,
     return max_w;
 }
 
+void LayoutGlyphs(Face* face, const char* text, float em_px,
+                  float line_height_px, float letter_spacing_px,
+                  std::vector<PlacedGlyph>& out)
+{
+    out.clear();
+    if (!face || !face->ftFace || !text || !*text || em_px <= 0.f)
+        return;
+
+    float ascender = 0.f, descender = 0.f, default_line_h = 0.f;
+    getVerticalMetrics(face, em_px, &ascender, &descender, &default_line_h);
+    (void)descender;
+    const float line_h = (line_height_px > 0.f) ? line_height_px : default_line_h;
+
+    float base_y     = ascender;
+    const char* line_start = text;
+
+    for (const char* p = text; ; ++p) {
+        if (*p == '\n' || *p == '\0') {
+            const int line_len = (int)(p - line_start);
+            if (line_len > 0) {
+                drawTextLine(face, line_start, line_len, em_px,
+                             0.f, base_y, nullptr, 0,
+                             false, false, 0.f, letter_spacing_px,
+                             &out);
+            }
+            if (*p == '\0') break;
+            base_y += line_h;
+            line_start = p + 1;
+        }
+    }
+}
+
+void* GetFtFace(Face* face) {
+    return (face && face->ftFace) ? (void*)face->ftFace : nullptr;
+}
+
 // ============================================================================
 // Public rendering API
 // ============================================================================
@@ -1385,13 +1662,13 @@ static float addTextLayout(ImDrawList* dl, Face* face,
 float AddText(ImDrawList* dl, Face* face,
               float em_px, ImVec2 pos,
               ImU32 col, const char* text,
-              bool outline, float outline_thickness,
-              float line_height_px, float letter_spacing_px, ImU32 hole_col)
+              bool fill, bool outline, float outline_thickness,
+              float line_height_px, float letter_spacing_px)
 {
     if (!dl || !face || !face->ftFace || !text || !*text) return 0.f;
     if (face->renderMode == RenderMode::Raster) return 0.f;
-    return addTextLayout(dl, face, em_px, pos, col, hole_col, text,
-                         true, outline, outline_thickness,
+    return addTextLayout(dl, face, em_px, pos, col, text,
+                         fill, outline, outline_thickness,
                          line_height_px, letter_spacing_px);
 }
 
@@ -1406,7 +1683,7 @@ float CalcTextWidth(Face* face, float em_px, const char* text,
             const int line_len = (int)(p - line_start);
             if (line_len > 0) {
                 const float w = drawTextLine(face, line_start, line_len, em_px,
-                                             0.f, 0.f, nullptr, 0, 0,
+                                             0.f, 0.f, nullptr, 0,
                                              false, false, 0.f,
                                              letter_spacing_px);
                 if (w > max_w) max_w = w;
@@ -1477,9 +1754,9 @@ bool RasterizeText(Face* face, float em_px, const char* text, ImU32 col,
             const int line_len = (int)(p - line_start);
             if (line_len > 0) {
                 drawTextLine(face, line_start, line_len, em_px,
-                             (float)pad, base_y, nullptr, col, 0,
+                             (float)pad, base_y, nullptr, col,
                              false, false, 0.f, letter_spacing_px,
-                             &out_rgba, out_w, out_h);
+                             nullptr, &out_rgba, out_w, out_h);
             }
             if (*p == '\0') break;
             base_y += line_h;
