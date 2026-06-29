@@ -358,9 +358,7 @@ void FreeFace(Face* face) {
         face->hbFont = nullptr;
     }
 #endif
-    for (auto& kv : face->glyphTexCache)
-        glr::Delete(kv.second.tex);
-    face->glyphTexCache.clear();
+    face->glyphTexCache.clear();  // atlas textures are owned by the GL renderer
     if (face->ftFace)  FT_Done_Face(face->ftFace);
     if (face->library) FT_Done_FreeType(face->library);
     delete face;
@@ -951,12 +949,65 @@ static void flatCubic(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2, Im
     flatCubic(E, p0123, p123, p23, p3, tolSq, depth + 1);
 }
 
+// CPU coverage fallback (used when the GPU analytic path is unavailable, e.g.
+// OpenGL ES 2 / WebGL1). Rasterizes the outline with FreeType's smooth renderer
+// into a w*h, top-down, 8-bit coverage bitmap, transformed into the SAME device
+// cell the GPU path uses (pad, y-flip, scale), so the composited result matches.
+static bool rasterOutlineCPU(FT_Library lib, const FT_Outline* ol,
+                             int w, int h, float sx, float sy,
+                             float bx0, float by1, int pad,
+                             std::vector<unsigned char>& a8) {
+    if (!lib || !ol || ol->n_points <= 0 || ol->n_contours <= 0)
+        return false;
+
+    // design point (X,Y) -> FT 26.6: x = X*sx + tx, y = Y*sy + ty (y-up; FT fills
+    // the bitmap top-down so the glyph top lands on row ~pad, matching the GPU cell).
+    const float tx = (float)pad - bx0 * sx;
+    const float ty = (float)h - (float)pad - by1 * sy;
+
+    std::vector<FT_Vector> pts((size_t)ol->n_points);
+    for (int i = 0; i < ol->n_points; ++i) {
+        const float X = (float)ol->points[i].x;
+        const float Y = (float)ol->points[i].y;
+        pts[i].x = (FT_Pos)std::lround((X * sx + tx) * 64.0f);
+        pts[i].y = (FT_Pos)std::lround((Y * sy + ty) * 64.0f);
+    }
+
+    FT_Outline oc;
+    oc.n_contours = ol->n_contours;
+    oc.n_points   = ol->n_points;
+    oc.points     = pts.data();
+    oc.tags       = ol->tags;       // fill flags + on/off-curve tags are unchanged
+    oc.contours   = ol->contours;
+    oc.flags      = ol->flags;      // carries the (non-zero / even-odd) fill rule
+
+    a8.assign((size_t)w * h, 0);
+    FT_Bitmap bmp;
+    std::memset(&bmp, 0, sizeof(bmp));
+    bmp.rows       = (unsigned)h;
+    bmp.width      = (unsigned)w;
+    bmp.pitch      = w;             // positive pitch -> rows stored top-down
+    bmp.num_grays  = 256;
+    bmp.pixel_mode = FT_PIXEL_MODE_GRAY;
+    bmp.buffer     = a8.data();
+    return FT_Outline_Get_Bitmap(lib, &oc, &bmp) == 0;
+}
+
 static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
                               const FT_Outline* ol, bool hinted, float em_px,
                               float originX, float originY,
                               float scale, float extrapX, float extrapY, ImU32 col) {
     if (!glr::Ready())
         return;
+
+    // Apply any pending atlas recycle exactly once per frame, before drawing —
+    // keeps recycling off the hot path and safe w.r.t. already-emitted quads.
+    static int s_lastFrame = -1;
+    const int  frame = ImGui::GetFrameCount();
+    if (frame != s_lastFrame) {
+        glr::BeginFrame();
+        s_lastFrame = frame;
+    }
 
     const ImVec2 fbScaleVec = ImGui::GetIO().DisplayFramebufferScale;
     const float  fbScale    = (fbScaleVec.y > 0.f) ? fbScaleVec.y : 1.f;
@@ -986,9 +1037,10 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
     if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
         return;
 
+    // The atlas owns all glyph textures; invalidating just drops cache entries
+    // (no texture deletion). Stale entries are also caught by the atlas-gen check
+    // below, in case the atlas recycled since they were rendered.
     if (face->glyphTexCacheGen != face->outlineGen) {
-        for (auto& kv : face->glyphTexCache)
-            glr::Delete(kv.second.tex);
         face->glyphTexCache.clear();
         face->glyphTexCacheGen = face->outlineGen;
     }
@@ -1001,9 +1053,11 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
 
     glr::GlyphTex tex;
     auto it = face->glyphTexCache.find(key);
-    if (it != face->glyphTexCache.end()) {
+    if (it != face->glyphTexCache.end() && it->second.valid &&
+        it->second.gen == glr::AtlasGen()) {
         tex = it->second;
-    } else {
+    } else if (glr::CoverageReady()) {
+        // GPU path: flatten curves to edges and accumulate signed coverage.
         std::vector<float> E;
         E.reserve(gc.segs.size() * 4);
         const float tolSq = 0.18f * 0.18f;
@@ -1023,6 +1077,14 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
             return;
         tex = glr::RenderGlyph(E.data(), (int)(E.size() / 4), w, h, 1.0f);
         face->glyphTexCache[key] = tex;
+    } else {
+        // CPU fallback (ES2 / WebGL1 / no blendable float): FreeType rasterizes
+        // the outline into the same device cell, uploaded into the atlas.
+        std::vector<unsigned char> a8;
+        if (!rasterOutlineCPU(face->library, ol, w, h, sx, sy, bx0, by1, pad, a8))
+            return;
+        tex = glr::UploadGlyph(a8.data(), w, h);
+        face->glyphTexCache[key] = tex;
     }
     if (!tex.valid)
         return;
@@ -1036,9 +1098,9 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
     const ImVec2 pmin(scrXmin - (float)pad / fbScale, scrYmin - (float)pad / fbScale);
     const ImVec2 pmax(pmin.x + (float)w / fbScale,    pmin.y + (float)h / fbScale);
 
-    // Coverage texture is bottom-up, so flip V when compositing.
+    // GlyphTex UVs are pre-oriented: (u0,v0)->pmin (top-left), (u1,v1)->pmax.
     dl->AddImage((ImTextureID)(intptr_t)tex.tex, pmin, pmax,
-                 ImVec2(0.f, 1.f), ImVec2(1.f, 0.f), col);
+                 ImVec2(tex.u0, tex.v0), ImVec2(tex.u1, tex.v1), col);
 }
 
 } // namespace
@@ -1051,6 +1113,9 @@ void ShutdownRenderer() {
 }
 bool RendererReady() {
     return glr::Ready();
+}
+void ForceCpuFallback(bool enable) {
+    glr::SetForceCpuFallback(enable);
 }
 
 struct StrokeOutlineCtx {
@@ -1661,15 +1726,26 @@ void* GetFtFace(Face* face) {
 
 float AddText(ImDrawList* dl, Face* face,
               float em_px, ImVec2 pos,
+              ImU32 col, const char* text)
+{
+    if (!dl || !face || !face->ftFace || !text || !*text) return 0.f;
+    if (face->renderMode == RenderMode::Raster) return 0.f;
+    const TextStyle st{};
+    return addTextLayout(dl, face, em_px, pos, col, text,
+                         st.fill, st.outline, st.outline_thickness,
+                         st.line_height_px, st.letter_spacing_px);
+}
+
+float AddText(ImDrawList* dl, Face* face,
+              float em_px, ImVec2 pos,
               ImU32 col, const char* text,
-              bool fill, bool outline, float outline_thickness,
-              float line_height_px, float letter_spacing_px)
+              const TextStyle& style)
 {
     if (!dl || !face || !face->ftFace || !text || !*text) return 0.f;
     if (face->renderMode == RenderMode::Raster) return 0.f;
     return addTextLayout(dl, face, em_px, pos, col, text,
-                         fill, outline, outline_thickness,
-                         line_height_px, letter_spacing_px);
+                         style.fill, style.outline, style.outline_thickness,
+                         style.line_height_px, style.letter_spacing_px);
 }
 
 float CalcTextWidth(Face* face, float em_px, const char* text,

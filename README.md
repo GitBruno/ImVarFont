@@ -1,6 +1,6 @@
 # ImVarFont
 
-Variable-font rendering and axis controls for [Dear ImGui](https://github.com/ocornut/imgui).
+**v1.0.0** · Variable-font rendering and axis controls for [Dear ImGui](https://github.com/ocornut/imgui).
 
 ![preview](example/preview.png)
 
@@ -10,9 +10,7 @@ and exposed as ImGui slider widgets.
 
 Filled glyphs are rasterized on the GPU with an analytic **coverage backend**
 (signed-area accumulation) — true counter holes and conflation-free
-anti-aliasing at any zoom and DPI. See
-[Glyph fill: the coverage backend](#glyph-fill-the-coverage-backend) for the
-design, trade-offs, and comparison to alternatives.
+anti-aliasing at any zoom and DPI.
 
 ---
 
@@ -23,12 +21,28 @@ design, trade-offs, and comparison to alternatives.
 - `AxisSliders()` — one `SliderFloat` per axis with the axis name and 4-char tag
 - `MetadataTable()` — family/style, variable flag, axis min/max/default table, live values
 - Three preview render modes: **Vector**, **Hinted vector**, **Raster**
-- Filled glyph rendering with true counter holes (GPU analytic signed-area coverage, cached per glyph)
-- Conflation-free anti-aliasing at any zoom/DPI — no MSAA, no external GL loader
-- Optional outline (stroke-only) preview mode
+- Filled glyphs with true counter holes via GPU signed-area coverage
+- Runs on desktop GL 3.3 and GLES 3; CPU FreeType fallback on ES2 / WebGL1
+- Optional outline (stroke-only) mode
 - Optional HarfBuzz GPOS kerning when built with `IMVARFONT_USE_HARFBUZZ`
 - Self-contained: drop-in source (`imgui_var_font.{h,cpp}` + `imvarfont_gl.{h,cpp}`)
-- Follows Dear ImGui naming conventions (PascalCase members, snake_case parameters)  
+
+---
+
+## Platform support
+
+Filled glyphs use the GPU coverage path where a **blendable `RGBA16F`** target is
+available, and transparently fall back to **FreeType CPU rasterization** (into the
+same atlas) where it isn't — so filled text renders anywhere Dear ImGui's
+OpenGL3 backend runs:
+
+| Target | Requirement | Glyph fill path |
+|---|---|---|
+| Desktop **OpenGL 3.3+** | core | GPU coverage |
+| **OpenGL ES 3.0** (Raspberry Pi 4/5, …) | `GL_EXT_color_buffer_half_float` | GPU coverage |
+| **OpenGL ES 2 / WebGL1**, or any device without a blendable float target | — | CPU fallback |
+
+> This choice is automatic at `InitRenderer()` time
 
 ---
 
@@ -56,16 +70,17 @@ ImU32 text_col = IM_COL32(255, 255, 255, 255);
 ImVarFont::SetRenderMode(face, ImVarFont::RenderMode::HintedVector);
 ImVarFont::SetHintingFlags(face, ImVarFont::HintingFlags::Native);
 
-ImVarFont::AddText(
-    ImGui::GetWindowDrawList(), face,
-    96.f,                                // em size in pixels
-    ImVec2((width - w) * 0.5f, y),       // top-left of text block
-    text_col,
-    "Hello",
-    true,                                // fill glyphs
-    false,                               // or/also stroke each contour
-    1.5f,                                // outline thickness (px)
-    0.f);                                // line height (0 = font default)
+// Simple (fill on, no outline, font-default line height):
+ImVarFont::AddText(ImGui::GetWindowDrawList(), face,
+                   96.f, ImVec2((width - w) * 0.5f, y), text_col, "Hello");
+
+// With styling (named fields — set only what you need):
+ImVarFont::TextStyle st;
+st.outline           = true;
+st.outline_thickness = 2.f;
+st.line_height_px    = 110.f;
+ImVarFont::AddText(ImGui::GetWindowDrawList(), face,
+                   96.f, ImVec2(x, y), text_col, "Hello", st);
 
 // Cleanup
 ImVarFont::FreeFace(face);
@@ -103,13 +118,21 @@ bool RasterizeText(Face*, float em_px, const char* text, ImU32 col,
 See `imgui_var_font.h` for the full API.  Key rendering entry points:
 
 ```cpp
-float AddText(ImDrawList*, Face*, float em_px, ImVec2 pos,
-              ImU32 col, const char* text,
-              bool fill = true,
-              bool outline = false,
-              float outline_thickness = 1.5f,
-              float line_height_px = 0.f,
-              float letter_spacing_px = 0.f);
+// Styling options — all fields have defaults, set only what you need:
+struct TextStyle {
+    bool  fill              = true;
+    bool  outline           = false;
+    float outline_thickness = 1.5f;
+    float line_height_px    = 0.f;   // 0 = font default
+    float letter_spacing_px = 0.f;
+};
+
+// Short form (fill=true, no outline, font-default line height):
+float AddText(ImDrawList*, Face*, float em_px, ImVec2 pos, ImU32 col, const char* text);
+
+// Full control via named fields:
+float AddText(ImDrawList*, Face*, float em_px, ImVec2 pos, ImU32 col, const char* text,
+              const TextStyle& style);
 
 float CalcTextWidth(Face*, float em_px, const char* text);
 float CalcAscenderPx(const Face*, float em_px);
@@ -121,10 +144,10 @@ float CalcLineHeightPx(const Face*, float em_px);
 
 ## Building the example
 
-The example (`example/main.cpp`) uses GLFW + OpenGL 3.3.  Dear ImGui and GLFW 
-are fetched automatically by CMake; **FreeType** must be on the system. Glyph 
-fill is rendered on the GPU. HarfBuzz is optional (GPOS kerning + OpenType features) 
-and enabled when found.
+The example (`example/main.cpp`) uses GLFW + OpenGL 3.3 (or OpenGL ES 3.0, see
+below).  Dear ImGui and GLFW are fetched automatically by CMake; **FreeType**
+must be on the system. Glyph fill is rendered on the GPU. HarfBuzz is optional
+(GPOS kerning + OpenType features) and enabled when found.
 
 ### Windows – MSYS2 / MinGW
 
@@ -161,6 +184,29 @@ cmake --build build
 ./example/ImVarFontExample
 ```
 
+### Raspberry Pi / OpenGL ES 3.0
+
+The renderer also targets **OpenGL ES 3.0**, so it runs in embedded/ES
+environments (Raspberry Pi 4/5, etc.). Configure with `-DIMVARFONT_GLES=ON`:
+
+```bash
+sudo apt install libfreetype-dev libgles2-mesa-dev libegl1-mesa-dev
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DIMVARFONT_GLES=ON
+cmake --build build
+./example/ImVarFontExample
+```
+
+This selects ImGui's ES backend, creates a GLES 3.0 context, and compiles the
+`#version 300 es` shaders. The GPU path needs a blendable `RGBA16F` target
+(`GL_EXT_color_buffer_half_float`); on ES2 / WebGL1 or a device lacking it, the
+renderer falls back to FreeType CPU rasterization (see
+[Portability & CPU fallback](#portability--cpu-fallback)).
+
+> ES is selected by ImGui's own `IMGUI_IMPL_OPENGL_ES3` flag — no ImVarFont
+> define needed. Hosts that build ImGui's ES backend (e.g. openFrameworks on the
+> Pi) already define it; the CMake option propagates it to `imvarfont` via
+> `imgui_impl`'s `PUBLIC` usage requirement.
+
 ---
 
 ## Rendering notes
@@ -173,12 +219,12 @@ cmake --build build
   stems align to the pixel grid. Hinting may shift slightly when axis sliders move.
 - **Raster mode** uses FreeType's grayscale renderer; re-rasterize when size or
   axes change (the example re-rasterizes on zoom).
-- **Filled vector modes**: glyph coverage is rasterized on the GPU with
-  signed-area accumulation under the non-zero winding rule, giving true counter
-  holes (the inside of `O`, `e`, `B`) and conflation-free anti-aliasing at any
-  zoom/DPI. Each glyph is rendered once to a cached coverage texture (keyed by
-  glyph + device size + axis state) and composited with `AddImage`. Call
-  `ImVarFont::InitRenderer(glfwGetProcAddress)` once a GL context is current.
+- **Filled vector modes**: glyph coverage is rasterized with signed-area
+  accumulation (non-zero winding) for true counter holes and conflation-free AA,
+  cached per glyph and composited with `AddImage`. Call
+  `ImVarFont::InitRenderer(glfwGetProcAddress)` once a GL context is current; see
+  [the coverage backend](#glyph-fill-the-coverage-backend) for details and the
+  CPU fallback.
 - **Outline mode** (`outline = true`): contours are stroked on top (or instead,
   when `fill = false`).
 - Quadratic (TrueType conic) Béziers are upgraded to cubics before being passed
@@ -186,124 +232,51 @@ cmake --build build
 
 ---
 
-## Glyph fill: the coverage backend
+### How it works
 
-Filled glyphs are rendered by an analytic **coverage backend** living in a single
-file (`imvarfont_gl.cpp`). The rest of the library never talks to OpenGL — it
-extracts curves, flattens them to line edges at the target *device* resolution,
-and hands the backend an **edge soup + a cell size**:
-
-```cpp
-// imvarfont_gl.h — the entire seam
-glr::GlyphTex glr::RenderGlyph(const float* edges, int edge_count,
-                               int w, int h, float gamma);
-```
-
-That seam is deliberately narrow. The backend owns *how* coverage is computed;
-everything upstream (FreeType, variable axes, caching, layout, ImGui
-compositing) is backend-agnostic. A different rasterizer can replace **only this
-file** without touching the public API.
-
-### How the current backend works
-
-Signed-area accumulation (the same idea behind FreeType's smooth rasterizer,
+Signed-area accumulation (FreeType's smooth rasterizer /
 [font-rs](https://medium.com/@raphlinus/inside-the-fastest-font-renderer-in-the-world-75ae5270c445)
-and Pathfinder, moved onto the GPU):
+/ Pathfinder, on the GPU): for each edge, a quad spanning to the cell's right
+border adds *signed* trapezoidal coverage (up-going `+`, down-going `−`) into an
+`RGBA16F` target with additive blending — the scanline running-sum done
+geometrically, no prefix pass. Holes carry opposite winding and cancel, so
+counters are exact with no ear-clipping or keyhole bridging. A resolve pass writes
+`(1,1,1,|coverage|^gamma)` into an `RGBA8` atlas cell, composited by ImGui's stock
+shader as `colour × coverage`.
 
-1. **Accumulate.** For every edge of the glyph, draw a quad spanning from the
-   edge rightward to the cell border, over the edge's vertical extent. A fragment
-   shader adds, per pixel, the *signed* trapezoidal coverage the edge
-   contributes (up-going edges `+`, down-going `−`). Additive blending into an
-   `RGBA16F` target. The horizontal running-sum a CPU scanline rasterizer needs
-   is realized geometrically by extending each quad to the right border, so no
-   prefix-sum pass is required. Holes carry opposite winding and cancel — true
-   counters, no ear-clipping, no keyhole bridging.
-2. **Resolve.** A fullscreen pass takes `|coverage|`, applies coverage gamma, and
-   writes `(1,1,1,α)` into an `RGBA8` cell so ImGui's stock shader composites it
-   as `colour × coverage` with no custom pipeline.
+Each glyph is rasterized once into a shared, shelf-packed atlas (keyed by glyph +
+device size + axis state) and reused as a textured quad; glyphs sharing a page
+batch into one draw call. The atlas grows by adding pages and recycles (bumping a
+generation that invalidates stale entries) only past a soft cap; oversized cells
+(extreme zoom) use a dedicated texture.
 
-Each glyph is rasterized once into a cached texture (keyed by glyph + device
-size + axis state) and re-used as a textured quad until its outline changes.
+### TODO
 
-### Pros
+Replace `imvarfont_gl.cpp` without touching the public API.
 
-- **Reference-quality AA.** Coverage is computed from true area, not point
-  samples — no MSAA, no shimmer, even weight on stems. This is what a *type*
-  tool needs: it shows the designer the letterform, not an approximation.
-- **Correct by construction.** Non-zero winding falls straight out of signed
-  accumulation; counters and overlapping contours just work. No fragile CPU
-  geometry.
-- **Resolution-independent source.** Curves are kept in design units and
-  flattened at the *device* pixel size, so it's crisp on 4K and re-flattens
-  correctly on zoom.
-- **Cheap in steady state.** A cache hit is a single `AddImage` (one quad).
+| Backend | Zoom / animate | Notes |
+|---|---|---|
+| **Signed-area** (current) | re-raster on size change | reference AA, ~1 file + 2 shaders, no extra deps |
+| CPU FreeType raster | re-raster on size change | the built-in fallback; FreeType only |
+| Loop-Blinn (future) | **free** (curves in shader) | high complexity; for continuous zoom / live morph |
 
-### Cons / limitations
+---
 
-- **It rasterizes, so it's resolution-bound per cache entry.** Zooming or
-  animating an axis is a cache *miss* → re-rasterize. Smooth at any *static*
-  size, but continuous zoom re-renders each frame (still cheap, but not free like
-  a pure curve-eval method).
-- **Per-glyph textures (v1), not an atlas.** Each cached glyph is its own
-  texture, so a glyph = its own draw call. Fine for a font viewer / headings;
-  for paragraphs of body text a shelf-packed atlas (same seam, future work)
-  would cut draw calls dramatically.
-- **Midpoint coverage approximation.** The fragment shader samples right-fraction
-  at the band mid-height rather than integrating the clamp exactly. Visually
-  indistinguishable on real glyphs; near-horizontal hairlines are the only place
-  an exact integral would differ.
-- **16-bit accumulation** can theoretically saturate on pathological
-  self-overlapping outlines; real fonts don't hit this.
+## Changelog
 
-### Alternatives (and whether they should replace it)
+### 1.0.0
 
-| Backend | Quality | Cold cost (first draw) | Warm cost (cached) | Zoom/animate | Complexity | Deps |
-|---|---|---|---|---|---|---|
-| **Signed-area coverage** (this) | Reference AA | ~1 draw, `O(edges)` quads + resolve | 1 quad (`AddImage`) | re-raster on size change | Low (~1 file, ~2 shaders) | none extra |
-| CPU FreeType raster + atlas | Reference AA (hinted option) | CPU rasterize + upload | 1 quad | re-raster on size change | Low–med | FreeType only |
-| **Loop-Blinn** (curves as triangles) | Great, but classic *conflation* at curve/edge joins unless resolved with MSAA/derivatives | curve→triangle setup | 1 mesh draw | **free** (curves eval'd in shader) | High (orientation, AA pass) | none extra |
-| **Banding / Slug-style** (per-pixel ray vs. curves) | Reference AA + direct curves | band/curve buffer build | 1 quad, heavier fragment shader | **free** | High | none extra (Slug itself is licensed) |
-| **SDF / MSDF** | Good at size, **rounds sharp corners**, not exact | offline/atlas gen | 1 quad | scalable but soft/edgy | Med | atlas gen tool |
-
-Rough numbers, *order-of-magnitude, not measured on a real machine* — they reflect
-algorithmic cost and published figures, so treat them as guidance:
-
-- **Cold rasterize**, a typical Latin glyph (~150–400 edges after flattening) into
-  a ~64–256 px cell: on the order of **tens of microseconds** of GPU time
-  (two passes, a few hundred small quads). The dominant real cost is the texture
-  allocation, which the cache amortizes to zero.
-- **Warm draw**: a single textured quad — **negligible**, indistinguishable from
-  drawing any other ImGui image.
-- **Quality**: against a 16× supersampled CPU reference, signed-area coverage is
-  effectively a visual match (sub-1% per-pixel coverage error from the midpoint
-  approximation). Loop-Blinn *without* a dedicated AA pass shows visible
-  conflation seams; MSDF shows measurable corner rounding at a 32–48 px atlas.
-
-> Want hard numbers for your fonts/hardware? Ask and I'll wire a small
-> frame-timed benchmark (cold vs. warm, glyphs/ms) into the example.
-
-### Recommendation — replace, or keep as the default?
-
-**Keep signed-area coverage as the default.** For a variable-font *tool*, the
-priorities are fidelity (Type Designers's letterforms must be honest) and a clean,
-low-dependency integration (Omar's ImGui ethos). This backend nails both with the
-least machinery, and the per-glyph cache makes typical UI use essentially free.
-
-The other techniques are **better as optional backends behind the same seam, not
-as a wholesale replacement**:
-
-- **Loop-Blinn / banding** become attractive only when you need *continuous*
-  zoom or per-frame axis animation at large sizes without re-rasterizing, or an
-  atlas-free pipeline. They eval curves directly in the shader (zoom is free) but
-  cost real complexity (Loop-Blinn's conflation problem needs a proper AA
-  strategy; banding needs a per-glyph curve buffer). Good candidates to **add**
-  the day a “live morphing poster at 4K” use-case appears — drop a second
-  `RenderGlyph` implementation into `imvarfont_gl.cpp`, no upstream changes.
-- **SDF / MSDF** is not an upgrade: it is cheap and scalable, but it rounds corners
-  and isn't exact, which is wrong for rendering typography.
-
-> **signed-area** is the right default; Loop-Blinn can be slotted in later 
-> as an *enhancement* without re-architecting.
+- GPU **analytic coverage** glyph fill (signed-area accumulation): true counter
+  holes, conflation-free anti-aliasing at any zoom/DPI.
+- **Shared shelf-packed atlas** — glyphs batch into few draw calls.
+- New API: `InitRenderer()` / `ShutdownRenderer()` / `RendererReady()`.
+- **OpenGL ES 3.0 support** (Raspberry Pi / embedded): build with
+  `-DIMVARFONT_GLES=ON`. ES is selected via ImGui's own `IMGUI_IMPL_OPENGL_ES3`
+  flag (no extra ImVarFont define). Uses `GL_EXT_color_buffer_half_float` for
+  blendable RGBA16F accumulation.
+- **CPU raster fallback**: when no blendable float target is available (ES2 /
+  WebGL1 / older drivers) the renderer rasterizes coverage with FreeType and
+  uploads it into the same atlas, so filled text renders everywhere ImGui runs.
 
 ---
 

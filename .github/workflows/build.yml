@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Linux: build the desktop GL 3.3 path and the OpenGL ES 3.0 path. The ES leg
+  # is a pure compile check (no GPU/display needed) and is the main reason this
+  # workflow exists — it catches breakage in the GLES code path that can't be
+  # built on a desktop-GL dev machine.
+  linux:
+    name: linux (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: desktop-gl
+            cmake_flags: ""
+          - name: gles3
+            cmake_flags: "-DIMVARFONT_GLES=ON"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libfreetype-dev libharfbuzz-dev \
+            libgl1-mesa-dev libegl-dev libgles-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libxkbcommon-dev \
+            libgtk-3-dev
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGLFW_BUILD_WAYLAND=OFF
+          ${{ matrix.cmake_flags }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+  # Windows: mirrors the MSYS2 / UCRT64 toolchain used for local development.
+  windows-msys2:
+    name: windows (msys2 ucrt64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-harfbuzz
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel

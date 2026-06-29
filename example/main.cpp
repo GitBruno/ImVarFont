@@ -10,8 +10,13 @@
 #include "imgui_var_font.h"
 
 #include <nfd.h>
+#if defined(IMGUI_IMPL_OPENGL_ES3)
+#include <GLES3/gl3.h>
+#endif
 #include <GLFW/glfw3.h>
-#ifdef _WIN32
+#if defined(IMGUI_IMPL_OPENGL_ES3)
+// GLES headers already included above.
+#elif defined(_WIN32)
 #include <GL/gl.h>
 #elif defined(__APPLE__)
 #include <OpenGL/gl3.h>
@@ -55,6 +60,7 @@ static float            g_previewZoom      = 1.f;
 
 static int              g_renderModeIdx    = 0;
 static int              g_hintingIdx       = 0;
+static bool             g_forceCpuFill     = false;   // test the CPU raster fallback
 static bool             g_rasterDirty      = true;
 static unsigned int     g_rasterTex        = 0;
 static int              g_rasterTexW       = 0;
@@ -379,6 +385,16 @@ static void DrawControls() {
         }
     }
 
+    // Filled vector glyphs normally use the GPU coverage path; this forces the
+    // CPU FreeType fallback (the path used on OpenGL ES 2 / WebGL1) so it can be
+    // compared on a desktop GL build. No effect in Raster mode.
+    if (g_renderModeIdx != (int)ImVarFont::RenderMode::Raster) {
+        if (ImGui::Checkbox("Force CPU fallback (test)", &g_forceCpuFill))
+            ImVarFont::ForceCpuFallback(g_forceCpuFill);
+        ImGui::SameLine();
+        ImGui::TextDisabled(ImVarFont::RendererReady() ? "(GPU ready)" : "(no GPU)");
+    }
+
     if (g_renderModeIdx == 2 && g_outline)
         ImGui::TextDisabled("Outline applies to vector modes only");
     if (g_outline) {
@@ -524,9 +540,12 @@ static void DrawPreview() {
                              { drawX + (float)g_rasterTexW, drawY + (float)g_rasterTexH });
             }
         } else {
-            ImVarFont::AddText(dl, g_face, emPx, { posX, posY },
-                               col, g_text, /*fill=*/true, g_outline,
-                               g_thickness * g_previewZoom, lineH, letterSp);
+            ImVarFont::TextStyle st;
+            st.outline           = g_outline;
+            st.outline_thickness = g_thickness * g_previewZoom;
+            st.line_height_px    = lineH;
+            st.letter_spacing_px = letterSp;
+            ImVarFont::AddText(dl, g_face, emPx, { posX, posY }, col, g_text, st);
         }
     } else {
         const char* hint = "Drop a .ttf / .otf file here,  or enter its path and press Load";
@@ -572,11 +591,19 @@ int main(int /*argc*/, char** /*argv*/) {
     glfwSetErrorCallback(glfwErrorCb);
     if (!glfwInit()) { NFD_Quit(); return 1; }
 
+#if defined(IMGUI_IMPL_OPENGL_ES3)
+    // OpenGL ES 3.0 context (Raspberry Pi / embedded). Requires a GLFW built
+    // with EGL + GLES support (the default on Pi OS / Wayland / X11).
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+#else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
 #endif
 
     constexpr int W = 1400, H = 900;
@@ -616,9 +643,15 @@ int main(int /*argc*/, char** /*argv*/) {
     g_uiFontSize = 15.f * g_dpi_scale;
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
+#if defined(IMGUI_IMPL_OPENGL_ES3)
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+#else
     ImGui_ImplOpenGL3_Init("#version 330 core");
+#endif
 
     // Analytic GPU glyph renderer (signed-area coverage). Uses GLFW's GL loader.
+    // The "Force CPU fallback" checkbox in the UI toggles ImVarFont::ForceCpuFallback
+    // at runtime to exercise the ES2 / WebGL1 path on desktop.
     if (!ImVarFont::InitRenderer((void* (*)(const char*))glfwGetProcAddress))
         std::fprintf(stderr, "ImVarFont: GPU renderer init failed; using CPU fallback\n");
 

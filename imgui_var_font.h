@@ -11,6 +11,15 @@
 //       ImVarFont::ApplyAxes(face);
 //   ImVarFont::AddText(ImGui::GetWindowDrawList(), face,
 //                      96.f, ImVec2(x, y), IM_COL32_WHITE, "Hello");
+//
+// Usage (with styling):
+//   ImVarFont::TextStyle st;
+//   st.outline           = true;
+//   st.outline_thickness = 2.f;
+//   st.letter_spacing_px = 1.f;
+//   ImVarFont::AddText(ImGui::GetWindowDrawList(), face,
+//                      96.f, ImVec2(x, y), IM_COL32_WHITE, "Hello", st);
+//
 //   // Cleanup:
 //   ImVarFont::FreeFace(face);
 //
@@ -49,12 +58,20 @@ struct Face;
 //
 // The analytic glyph renderer rasterizes coverage on the GPU. Call InitRenderer
 // once a GL context is current, passing your GL proc loader (e.g.
-// glfwGetProcAddress), and ShutdownRenderer before the context is destroyed. If
-// InitRenderer is not called (or fails), filled text falls back to the CPU path.
+// glfwGetProcAddress), and ShutdownRenderer before the context is destroyed.
+// When InitRenderer succeeds but the GPU coverage path is unavailable (OpenGL
+// ES 2 / WebGL1, or no blendable float target), filled text is rasterized on the
+// CPU with FreeType into the same atlas. If InitRenderer is never called (or
+// fails outright), filled text is skipped.
+//
+// ForceCpuFallback(true) disables the GPU path so the CPU fallback can be
+// exercised on a desktop GL build — for testing only. It can be toggled live
+// (e.g. from a checkbox); cached glyphs re-render on the next frame.
 // ---------------------------------------------------------------------------
 bool InitRenderer(void* (*gl_get_proc_address)(const char*));
 void ShutdownRenderer();
 bool RendererReady();
+void ForceCpuFallback(bool enable);
 
 RenderMode    GetRenderMode(const Face* face);
 void          SetRenderMode(Face* face, RenderMode mode);
@@ -215,27 +232,42 @@ ImFont* SetImGuiFont(ImFontAtlas* atlas, Face* face, float size_pixels);
 // Rendering  (outlines → ImDrawList, no texture atlas required)
 // ---------------------------------------------------------------------------
 
-// Render UTF-8 text as filled glyph outlines into dl.
+// Styling options for AddText (all fields have sensible defaults so you can
+// set only what you need).
 //
-//   em_px              : em-square size in screen pixels  (controls text size)
-//   pos                : top-left corner of the text block in screen coordinates
-//                        (baseline sits at pos.y + ascender * scale)
-//   col                : fill colour, e.g. IM_COL32(255, 255, 255, 255)
-//   fill               : when true, fill glyph contours
-//   outline            : when true, stroke each contour (can combine with fill)
-//   outline_thickness  : stroke width in pixels (only used when outline is true)
-//   line_height_px     : vertical advance per newline; 0 = font default
-//   letter_spacing_px  : extra gap after each glyph except the last on a line; 0 = none
+//   C++17 (portable):
+//     ImVarFont::TextStyle st;
+//     st.outline = true; st.line_height_px = h;
+//     ImVarFont::AddText(dl, face, em, pos, col, "Hello", st);
 //
-// Returns the total advance width of the rendered string in pixels.
+//   C++20 (designated initialisers):
+//     ImVarFont::AddText(dl, face, em, pos, col, "Hello",
+//                        { .outline = true, .line_height_px = h });
+struct TextStyle {
+    bool  fill              = true;   // fill glyph contours (GPU coverage / CPU FreeType)
+    bool  outline           = false;  // stroke each contour (combinable with fill)
+    float outline_thickness = 1.5f;   // stroke width in pixels (used when outline=true)
+    float line_height_px    = 0.f;    // vertical advance per newline; 0 = font default
+    float letter_spacing_px = 0.f;    // extra gap after each glyph except the last; 0 = none
+};
+
+// Render UTF-8 text into dl.
+//
+//   em_px : em-square size in screen pixels (controls text size)
+//   pos   : top-left corner of the text block; baseline = pos.y + ascender
+//   col   : colour, e.g. IM_COL32_WHITE
+//
+// Short form — fill with col, no outline, font-default line height:
+float AddText(ImDrawList* dl, Face* face,
+              float em_px, ImVec2 pos,
+              ImU32 col, const char* text);
+
+// Full control via TextStyle (named fields; style is not defaulted to avoid
+// ambiguity with the 6-arg form above):
 float AddText(ImDrawList* dl, Face* face,
               float em_px, ImVec2 pos,
               ImU32 col, const char* text,
-              bool fill = true,
-              bool outline = false,
-              float outline_thickness = 1.5f,
-              float line_height_px = 0.f,
-              float letter_spacing_px = 0.f);
+              const TextStyle& style);
 
 // Measure total advance width without rendering (useful for centring).
 float CalcTextWidth(Face* face, float em_px, const char* text,

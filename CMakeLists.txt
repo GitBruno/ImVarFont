@@ -1,8 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(ImVarFonts VERSION 0.1.0 LANGUAGES CXX)
+project(ImVarFonts VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Build for OpenGL ES 3.0 instead of desktop GL 3.3 (e.g. Raspberry Pi). Enables
+# the GLES path in the analytic renderer, ImGui's ES backend, and a GLES context
+# in the example. Default OFF (desktop).
+option(IMVARFONT_GLES "Target OpenGL ES 3.0 (Raspberry Pi / embedded)" OFF)
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -14,6 +19,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Freetype REQUIRED)
 find_package(OpenGL   REQUIRED)
+
+# GL libraries to link: desktop GL via the imported target, or GLES v2 + EGL on
+# embedded targets (Raspberry Pi etc.).
+if(IMVARFONT_GLES)
+    set(IMVARFONT_GL_LIBS GLESv2 EGL)
+    message(STATUS "ImVarFont: targeting OpenGL ES 3.0")
+else()
+    set(IMVARFONT_GL_LIBS OpenGL::GL)
+endif()
 
 include(FetchContent)
 
@@ -69,11 +83,14 @@ add_library(imgui_impl STATIC
     ${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp
 )
 target_compile_definitions(imgui_impl PUBLIC IMGUI_ENABLE_FREETYPE)
+if(IMVARFONT_GLES)
+    target_compile_definitions(imgui_impl PUBLIC IMGUI_IMPL_OPENGL_ES3)
+endif()
 target_include_directories(imgui_impl PUBLIC
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
 )
-target_link_libraries(imgui_impl PUBLIC glfw OpenGL::GL Freetype::Freetype)
+target_link_libraries(imgui_impl PUBLIC glfw ${IMVARFONT_GL_LIBS} Freetype::Freetype)
 
 # ---------------------------------------------------------------------------
 # ImVarFont library
@@ -90,8 +107,10 @@ target_include_directories(imvarfont PUBLIC
 target_link_libraries(imvarfont PUBLIC
     Freetype::Freetype
     imgui_impl
-    OpenGL::GL
+    ${IMVARFONT_GL_LIBS}
 )
+# ES selection comes from imgui_impl's PUBLIC IMGUI_IMPL_OPENGL_ES3 (inherited
+# transitively); no separate ImVarFont flag is needed.
 if(IMVARFONT_HARFBUZZ_FOUND)
     target_compile_definitions(imvarfont PUBLIC IMVARFONT_USE_HARFBUZZ)
     target_link_libraries(imvarfont PUBLIC PkgConfig::HARFBUZZ)
@@ -116,10 +135,12 @@ target_link_libraries(ImVarFontExample PRIVATE
     imvarfont
     imgui_impl
     glfw
-    OpenGL::GL
+    ${IMVARFONT_GL_LIBS}
     Freetype::Freetype
     nfd
 )
+# IMGUI_IMPL_OPENGL_ES3 is inherited from imgui_impl (PUBLIC) when IMVARFONT_GLES
+# is ON; the example keys its GLES context path off that same flag.
 
 # Put the binary next to the source so relative font paths work easily
 set_target_properties(ImVarFontExample PROPERTIES
