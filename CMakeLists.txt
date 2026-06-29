@@ -1,37 +1,24 @@
 cmake_minimum_required(VERSION 3.20)
-project(ImVarFonts VERSION 1.0.0 LANGUAGES CXX)
+project(ImVarFont VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Build for OpenGL ES 3.0 instead of desktop GL 3.3 (e.g. Raspberry Pi). Enables
-# the GLES path in the analytic renderer, ImGui's ES backend, and a GLES context
-# in the example. Default OFF (desktop).
-option(IMVARFONT_GLES "Target OpenGL ES 3.0 (Raspberry Pi / embedded)" OFF)
-
-# ---------------------------------------------------------------------------
-# Dependencies
-#
-# FreeType must be present on the system (or via vcpkg toolchain).
-# imgui and glfw are fetched at configure time so users don't need to install
-# them manually.
-# ---------------------------------------------------------------------------
+# Desktop GL 3.3 by default; GLES 3.0 for Raspberry Pi / embedded.
+option(IMVARFONT_GLES "Target OpenGL ES 3.0" OFF)
 
 find_package(Freetype REQUIRED)
-find_package(OpenGL   REQUIRED)
+find_package(OpenGL REQUIRED)
 
-# GL libraries to link: desktop GL via the imported target, or GLES v2 + EGL on
-# embedded targets (Raspberry Pi etc.).
 if(IMVARFONT_GLES)
     set(IMVARFONT_GL_LIBS GLESv2 EGL)
-    message(STATUS "ImVarFont: targeting OpenGL ES 3.0")
+    message(STATUS "ImVarFont: OpenGL ES 3.0")
 else()
     set(IMVARFONT_GL_LIBS OpenGL::GL)
 endif()
 
 include(FetchContent)
 
-# HarfBuzz (GPOS/OpenType layout kerning) — optional but enabled when found
 find_package(PkgConfig QUIET)
 set(IMVARFONT_HARFBUZZ_FOUND FALSE)
 if(PkgConfig_FOUND)
@@ -41,22 +28,16 @@ if(PkgConfig_FOUND)
     endif()
 endif()
 
-# Dear ImGui  (docking branch – enables ImGuiDockspace for future use)
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG        docking
     GIT_SHALLOW    TRUE
 )
-
-# Native File Dialog Extended
 FetchContent_Declare(nfd
     GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
     GIT_TAG        v1.2.1
     GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(nfd)
-
-# GLFW
 FetchContent_Declare(glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
     GIT_TAG        3.4
@@ -66,13 +47,9 @@ set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(imgui nfd glfw)
 
-FetchContent_MakeAvailable(imgui glfw)
-
-# ---------------------------------------------------------------------------
-# Build imgui as a static library (imgui has no CMakeLists of its own)
-# ---------------------------------------------------------------------------
-
+# Dear ImGui (+ GLFW / OpenGL3 backends + FreeType)
 add_library(imgui_impl STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -92,57 +69,36 @@ target_include_directories(imgui_impl PUBLIC
 )
 target_link_libraries(imgui_impl PUBLIC glfw ${IMVARFONT_GL_LIBS} Freetype::Freetype)
 
-# ---------------------------------------------------------------------------
-# ImVarFont library
-# ---------------------------------------------------------------------------
+# GPU analytic coverage (ImGui-free)
+add_library(varfont_gl STATIC varfont_gl.cpp)
+target_include_directories(varfont_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(varfont_gl PUBLIC ${IMVARFONT_GL_LIBS})
 
-add_library(imvarfont STATIC
-    imgui_var_font.cpp
-    imvarfont_gl.cpp
-)
+# Dear ImGui integration (+ FreeType morph core)
+add_library(imvarfont STATIC imgui_var_font.cpp)
 target_include_directories(imvarfont PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${imgui_SOURCE_DIR}            # for imgui.h
+    ${imgui_SOURCE_DIR}
 )
-target_link_libraries(imvarfont PUBLIC
-    Freetype::Freetype
-    imgui_impl
-    ${IMVARFONT_GL_LIBS}
-)
-# ES selection comes from imgui_impl's PUBLIC IMGUI_IMPL_OPENGL_ES3 (inherited
-# transitively); no separate ImVarFont flag is needed.
+target_link_libraries(imvarfont PUBLIC varfont_gl Freetype::Freetype imgui_impl)
 if(IMVARFONT_HARFBUZZ_FOUND)
     target_compile_definitions(imvarfont PUBLIC IMVARFONT_USE_HARFBUZZ)
     target_link_libraries(imvarfont PUBLIC PkgConfig::HARFBUZZ)
-    message(STATUS "ImVarFont: HarfBuzz enabled (GPOS kerning)")
+    message(STATUS "ImVarFont: HarfBuzz enabled")
 else()
-    message(STATUS "ImVarFont: HarfBuzz not found — legacy kern table only")
+    message(STATUS "ImVarFont: HarfBuzz not found (kern table only)")
 endif()
 
-# ---------------------------------------------------------------------------
-# Example executable
-# ---------------------------------------------------------------------------
-
-add_executable(ImVarFontExample
-    example/main.cpp
-)
+# Interactive example
+add_executable(ImVarFontExample example/main.cpp)
 target_include_directories(ImVarFontExample PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
 )
 target_link_libraries(ImVarFontExample PRIVATE
-    imvarfont
-    imgui_impl
-    glfw
-    ${IMVARFONT_GL_LIBS}
-    Freetype::Freetype
-    nfd
+    imvarfont imgui_impl glfw ${IMVARFONT_GL_LIBS} Freetype::Freetype nfd
 )
-# IMGUI_IMPL_OPENGL_ES3 is inherited from imgui_impl (PUBLIC) when IMVARFONT_GLES
-# is ON; the example keys its GLES context path off that same flag.
-
-# Put the binary next to the source so relative font paths work easily
 set_target_properties(ImVarFontExample PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/example
 )

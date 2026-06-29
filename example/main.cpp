@@ -29,6 +29,7 @@
 #include <vector>
 #include <algorithm>
 
+
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
@@ -47,6 +48,8 @@ static ImVec4           g_textColor   = { 1.00f, 1.00f, 1.00f, 1.00f };
 static ImVec4           g_bgColor     = { 0.04f, 0.04f, 0.07f, 1.00f };
 
 static bool             g_extrapolate      = false;
+static bool             g_morph            = false;  // re-raster-free axis morph
+static bool             g_vsync            = true;   // swap interval; off = uncapped (benchmarking)
 static float            g_dpi_scale        = 1.0f;  // set from glfwGetWindowContentScale
 
 static bool             g_useFontForUi     = false;
@@ -88,35 +91,6 @@ static void tryLoadFont() {
     g_rasterDirty = true;
 }
 
-static ImFont* loadSystemUiFont(ImFontAtlas* atlas, float size_px) {
-#if defined(_WIN32)
-    const char* ui_font_paths[] = {
-        "C:/Windows/Fonts/segoeui.ttf",
-        "C:/Windows/Fonts/calibri.ttf",
-        nullptr
-    };
-#elif defined(__APPLE__)
-    const char* ui_font_paths[] = {
-        "/System/Library/Fonts/SFNS.ttf",
-        "/Library/Fonts/Arial.ttf",
-        nullptr
-    };
-#else
-    const char* ui_font_paths[] = {
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        nullptr
-    };
-#endif
-    for (int i = 0; ui_font_paths[i]; ++i) {
-        if (ImFont* font = atlas->AddFontFromFileTTF(ui_font_paths[i], size_px))
-            return font;
-    }
-    ImFontConfig cfg;
-    cfg.SizePixels = size_px;
-    return atlas->AddFontDefault(&cfg);
-}
-
 static void applyUiFontSize() {
     ImGuiStyle& style = ImGui::GetStyle();
     style.FontSizeBase = g_uiFontSize;
@@ -132,7 +106,9 @@ static void rebuildUiFont() {
     if (g_useFontForUi && g_face) {
         g_uiFont = ImVarFont::SetImGuiFont(io.Fonts, g_face, g_uiFontSize);
     } else {
-        g_uiFont = loadSystemUiFont(io.Fonts, g_uiFontSize);
+        ImFontConfig cfg;
+        cfg.SizePixels = g_uiFontSize;
+        g_uiFont = io.Fonts->AddFontDefault(&cfg);
     }
 
     if (g_uiFont)
@@ -191,6 +167,7 @@ static void syncRenderSettings() {
     if (!g_face) return;
     ImVarFont::SetRenderMode(g_face, (ImVarFont::RenderMode)g_renderModeIdx);
     ImVarFont::SetHintingFlags(g_face, (ImVarFont::HintingFlags)g_hintingIdx);
+    ImVarFont::EnableMorph(g_face, g_morph, g_extrapolate);
 }
 
 static void uploadRasterTexture(const std::vector<uint8_t>& px, int w, int h) {
@@ -238,7 +215,11 @@ static void SetupDockLayout(ImGuiID dockspace_id) {
     ImGuiID dock_left  = ImGui::DockBuilderSplitNode(dock_main, ImGuiDir_Left,  0.22f, nullptr, &dock_main);
     ImGuiID dock_right = ImGui::DockBuilderSplitNode(dock_main, ImGuiDir_Right, 0.26f, nullptr, &dock_main);
     ImGuiID dock_bottom = ImGui::DockBuilderSplitNode(dock_main, ImGuiDir_Down, 0.28f, nullptr, &dock_main);
+    // Performance gets its own fixed pane at the top of the left column so the
+    // metrics stay visible while the axis sliders scroll in Controls below.
+    ImGuiID dock_left_top = ImGui::DockBuilderSplitNode(dock_left, ImGuiDir_Up, 0.30f, nullptr, &dock_left);
 
+    ImGui::DockBuilderDockWindow("Performance", dock_left_top);
     ImGui::DockBuilderDockWindow("Controls",  dock_left);
     ImGui::DockBuilderDockWindow("Preview",   dock_main);
     ImGui::DockBuilderDockWindow("Metadata",  dock_right);
@@ -279,6 +260,48 @@ static void DrawDockSpace() {
 // ---------------------------------------------------------------------------
 // Controls window  (left panel)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Performance window  (own dockable pane so metrics stay put while the axis
+// sliders scroll in the Controls panel)
+// ---------------------------------------------------------------------------
+
+static void DrawPerformance() {
+    ImGui::Begin("Performance");
+
+    // ImGui keeps a smoothed framerate; show frame time + FPS so the render cost is
+    // visible while panning/morphing. The path line reports which morph rasteriser
+    // is live so it's clear what the numbers reflect.
+    const float fps = ImGui::GetIO().Framerate;
+    const float frameMs = fps > 0.f ? 1000.f / fps : 0.f;
+    ImGui::Text("%.2f ms/frame  (%.0f FPS)", frameMs, fps);
+    const char* path =
+        (g_morph && ImVarFont::PreferGpuMorphRenderer() && ImVarFont::GpuMorphAvailable())
+            ? "morph: GPU reconstruction"
+        : (g_morph && ImVarFont::PreferSlugRenderer())
+            ? "morph: CPU blend -> exact-curve coverage"
+        : g_morph ? "morph: CPU blend -> signed-area coverage"
+                  : "static glyph cache";
+    ImGui::TextDisabled("%s", path);
+
+    // Per-phase CPU breakdown (last completed frame). "GPU/other" is the frame
+    // remainder: when it dominates we are fill/vsync-bound; when blend or raster
+    // dominates we are CPU-bound and know exactly which phase to attack.
+    const ImVarFont::RenderProfile rp = ImVarFont::GetRenderProfile();
+    const float other = frameMs - rp.blendMs - rp.rasterMs;
+    ImGui::Text("  blend (CPU)   %6.2f ms", rp.blendMs);
+    ImGui::Text("  raster submit %6.2f ms", rp.rasterMs);
+    ImGui::Text("  GPU / other   %6.2f ms", other > 0.f ? other : 0.f);
+    ImGui::Text("  glyphs %d   rebuilds %d", rp.glyphs, rp.rebuilds);
+    if (rp.glyphs > 0)
+        ImGui::TextDisabled("  %.1f us/glyph CPU",
+                            1000.f * (rp.blendMs + rp.rasterMs) / (float)rp.glyphs);
+    ImGui::Checkbox("VSync", &g_vsync);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(off = uncapped, for benchmarking)");
+
+    ImGui::End();
+}
 
 static void DrawControls() {
     ImGui::Begin("Controls");
@@ -370,12 +393,13 @@ static void DrawControls() {
     ImGui::Text("Render mode");
     ImGui::SetNextItemWidth(-1.f);
     if (ImGui::Combo("##renderMode", &g_renderModeIdx,
-                     "Vector\0Hinted vector\0Raster\0")) {
+                     "Vector\0Hinted vector\0Raster\0Loop-Blinn\0Loop-Blinn (live)\0")) {
         syncRenderSettings();
         g_rasterDirty = true;
     }
 
-    if (g_renderModeIdx != 0) {
+    if (g_renderModeIdx == (int)ImVarFont::RenderMode::HintedVector ||
+        g_renderModeIdx == (int)ImVarFont::RenderMode::Raster) {
         ImGui::Text("Hinting");
         ImGui::SetNextItemWidth(-1.f);
         if (ImGui::Combo("##hinting", &g_hintingIdx,
@@ -455,7 +479,62 @@ static void DrawControls() {
         ImGui::Checkbox("Extrapolate beyond limits", &g_extrapolate);
         if (ImGui::IsItemEdited() && g_face) {
             ImVarFont::ApplyAxes(g_face, g_extrapolate);
+            if (g_morph) ImVarFont::EnableMorph(g_face, true, g_extrapolate);
             g_rasterDirty = true;
+        }
+
+        // GPU-style morphing — axis drags blend a cached base outline plus
+        // per-axis deltas instead of re-instancing FreeType (re-rasterization-free).
+        if (ImGui::Checkbox("Morph axes (no re-raster)", &g_morph)) {
+            ImVarFont::EnableMorph(g_face, g_morph, g_extrapolate);
+            if (!g_morph) ImVarFont::ApplyAxes(g_face, g_extrapolate);  // resync FT
+            g_rasterDirty = true;
+        }
+        if (g_morph)
+            ImGui::TextDisabled(ImVarFont::RendererReady()
+                                ? "Knot-lattice blend (live GPU coverage)"
+                                : "Needs GPU renderer; inactive on this backend");
+
+        // Exact-curve analytic-coverage rasterizer. Feeds the morph output's
+        // quadratics straight to the GPU; single-pass, flattening-free, exact area.
+        if (ImVarFont::SlugRendererAvailable()) {
+            bool slug = ImVarFont::PreferSlugRenderer();
+            if (ImGui::Checkbox("Exact-curve coverage (analytic GPU)", &slug))
+                ImVarFont::PreferSlugRenderer(slug);
+            if (slug)
+                ImGui::TextDisabled("Exact-area coverage on quadratics (no flattening)");
+        } else {
+            ImGui::TextDisabled("Exact-curve coverage: unavailable on this backend");
+        }
+
+        // GPU morph reconstruction: rebuild control points on the GPU from a static
+        // base+delta buffer (axis fractions = uniforms). An axis drag/zoom is then a
+        // uniform update with no per-glyph CPU outline blend or per-frame upload.
+        if (g_morph && ImVarFont::GpuMorphAvailable()) {
+            bool gpum = ImVarFont::PreferGpuMorphRenderer();
+            if (ImGui::Checkbox("GPU morph reconstruction (base + frac*delta)", &gpum))
+                ImVarFont::PreferGpuMorphRenderer(gpum);
+            if (gpum)
+                ImGui::TextDisabled("Axis/zoom = uniform update; control points rebuilt on GPU");
+        } else if (g_morph) {
+            ImGui::TextDisabled("GPU morph reconstruction: unavailable on this backend");
+        }
+
+        // Grid-fit small sizes: render small text through FreeType's own autohinter +
+        // raster (guaranteed FreeType parity, no shape distortion). Runs static and
+        // under a live morph; above the size cap it is a no-op (analytic / GPU morph).
+        bool gf = ImVarFont::PreferGridFit();
+        if (ImGui::Checkbox("FreeType-hint small text", &gf)) {
+            ImVarFont::PreferGridFit(gf);
+            g_rasterDirty = true;
+        }
+        if (gf) {
+            float maxPx = ImVarFont::PreferGridFitMaxPx();
+            if (ImGui::SliderFloat("Max px/em", &maxPx, 8.f, 48.f, "%.0f")) {
+                ImVarFont::PreferGridFitMaxPx(maxPx);
+                g_rasterDirty = true;
+            }
+            ImGui::TextDisabled("FreeType raster below %.0f px/em; analytic above", maxPx);
         }
     }
 
@@ -559,6 +638,7 @@ static void DrawPreview() {
     ImGui::End();
 }
 
+
 // ---------------------------------------------------------------------------
 // Metadata window  (right panel)
 // ---------------------------------------------------------------------------
@@ -585,8 +665,17 @@ static void glfwErrorCb(int err, const char* msg) {
     fprintf(stderr, "GLFW error %d: %s\n", err, msg);
 }
 
-int main(int /*argc*/, char** /*argv*/) {
+
+
+int main(int argc, char** argv) {
     NFD_Init();
+
+    // Optional: pass a .ttf/.otf path as the first non-option argument.
+    // Otherwise drop a font on the window or use Load in Controls.
+    const char* cliFont = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i][0] != '-') { cliFont = argv[i]; break; }
+    }
 
     glfwSetErrorCallback(glfwErrorCb);
     if (!glfwInit()) { NFD_Quit(); return 1; }
@@ -606,7 +695,7 @@ int main(int /*argc*/, char** /*argv*/) {
 #endif
 #endif
 
-    constexpr int W = 1400, H = 900;
+    constexpr int W = 1920, H = 1080;
     GLFWwindow* window = glfwCreateWindow(W, H,
                                            "ImVarFont  –  Variable Font Viewer",
                                            nullptr, nullptr);
@@ -649,17 +738,28 @@ int main(int /*argc*/, char** /*argv*/) {
     ImGui_ImplOpenGL3_Init("#version 330 core");
 #endif
 
-    // Analytic GPU glyph renderer (signed-area coverage). Uses GLFW's GL loader.
+    // Analytic GPU glyph renderer (signed-area + exact-curve backends). Uses GLFW's GL loader.
     // The "Force CPU fallback" checkbox in the UI toggles ImVarFont::ForceCpuFallback
     // at runtime to exercise the ES2 / WebGL1 path on desktop.
     if (!ImVarFont::InitRenderer((void* (*)(const char*))glfwGetProcAddress))
         std::fprintf(stderr, "ImVarFont: GPU renderer init failed; using CPU fallback\n");
 
+    if (cliFont) {
+        strncpy(g_fontPath, cliFont, sizeof(g_fontPath) - 1);
+        g_fontPath[sizeof(g_fontPath) - 1] = '\0';
+        tryLoadFont();
+    }
+
     rebuildUiFont();
 
+
     // ── Main loop ────────────────────────────────────────────────────────────
+    int appliedSwap = 1;  // matches glfwSwapInterval(1) above
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        const int wantSwap = g_vsync ? 1 : 0;
+        if (wantSwap != appliedSwap) { glfwSwapInterval(wantSwap); appliedSwap = wantSwap; }
 
         if (g_uiFontDirty)
             rebuildUiFont();
@@ -669,6 +769,7 @@ int main(int /*argc*/, char** /*argv*/) {
         ImGui::NewFrame();
 
         DrawDockSpace();
+        DrawPerformance();
         DrawControls();
         DrawPreview();
         DrawMetadata();
@@ -679,7 +780,7 @@ int main(int /*argc*/, char** /*argv*/) {
         int fbW = 0, fbH = 0;
         glfwGetFramebufferSize(window, &fbW, &fbH);
         glViewport(0, 0, fbW, fbH);
-        glClearColor(0.04f, 0.04f, 0.07f, 1.f);
+        glClearColor(g_bgColor.x, g_bgColor.y, g_bgColor.z, g_bgColor.w);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
@@ -695,5 +796,4 @@ int main(int /*argc*/, char** /*argv*/) {
     glfwDestroyWindow(window);
     glfwTerminate();
     NFD_Quit();
-    return 0;
 }

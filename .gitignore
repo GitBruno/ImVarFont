@@ -1,4 +1,4 @@
-build/
+build*/
 out/
 .vs/
 .vscode/
@@ -10,3 +10,12 @@ cmake_install.cmake
 *.sln
 *.vcxproj*
 Makefile
+
+# Example binary (CMake RUNTIME_OUTPUT_DIRECTORY)
+example/*.exe
+example/*.pdb
+example/*.bin
+example/ImVarFontExample
+
+# ImGui runtime state
+imgui.ini

@@ -26,7 +26,7 @@
 // Required: FreeType 2.x  (link with freetype)
 // Optional: nothing else  (only imgui.h)
 //
-// License: MIT
+// License: MIT  (WTFPL if your name is Omar Cornut — thanks for Dear ImGui)
 
 #pragma once
 #include "imgui.h"
@@ -43,6 +43,9 @@ enum class RenderMode {
     Vector,        // Unhinted design-unit outlines (best for zoom / extrapolation)
     HintedVector,  // Hinted outlines at em_px, drawn as ImDrawList paths
     Raster,        // FreeType grayscale bitmap composite (best static quality)
+    LoopBlinn,     // Unhinted outlines filled analytically (Loop-Blinn quadratics)
+    LoopBlinnLive, // Loop-Blinn re-rendered every frame (no atlas cache); for
+                   // re-rasterization-free zoom / variable-axis morphing
 };
 
 enum class HintingFlags {
@@ -72,6 +75,62 @@ bool InitRenderer(void* (*gl_get_proc_address)(const char*));
 void ShutdownRenderer();
 bool RendererReady();
 void ForceCpuFallback(bool enable);
+
+// Route the live/morph render path through the public-domain Slug analytic-
+// coverage rasterizer when available (SlugRendererAvailable()). Single-pass,
+// supersample-free, curves fed directly to the GPU. Toggle live (e.g. a
+// checkbox) to A/B against the default signed-area coverage path.
+void PreferSlugRenderer(bool enable);
+bool PreferSlugRenderer();
+
+// Reconstruct morph glyphs on the GPU (base + Σ frac·delta from a static per-glyph
+// delta buffer, axis fractions as uniforms) instead of CPU-blending and re-uploading
+// curves each frame. An axis drag or zoom becomes a uniform update with no per-glyph
+// CPU outline work. Requires GpuMorphAvailable(); falls back transparently otherwise.
+// Default off. Toggle freely (live glyphs re-render through the active path).
+void PreferGpuMorphRenderer(bool enable);
+bool PreferGpuMorphRenderer();
+bool GpuMorphAvailable();
+bool SlugRendererAvailable();
+
+// Grid-fit small sizes (FreeType hinting). Hinting only matters at small sizes, and the
+// only way to be truly on par with FreeType is to use FreeType: when enabled, filled
+// glyphs below a pixel-size cutoff are rendered through FreeType's own autohinter +
+// grayscale raster (FT_LOAD_FORCE_AUTOHINT + FT_Render_Glyph) straight into the glyph
+// cache -- literally FreeType, no shape distortion. Each snapshot is keyed by glyph,
+// em, and the current variation instance (axis values); static text reuses the cache,
+// while a live morph re-rasterizes into a transient page when axes move (cheap at
+// small ppem). Above the cutoff it is a no-op and the analytic outline / GPU morph
+// fast path is used (large text needs no hinting). Off by default; toggle freely.
+void PreferGridFit(bool enable);
+bool PreferGridFit();
+
+// Grid-fit mode:
+//   Off      - no hinting (analytic outline / GPU morph; best for large/animated text).
+//   FreeType - FreeType's own autohinter + grayscale raster into the glyph cache below
+//              the size cutoff. Guaranteed FreeType parity; runs static and under morph.
+// PreferGridFit(bool) is a thin alias: true => FreeType, false => Off.
+enum class GridFitMode { Off, FreeType };
+void        PreferGridFitMode(GridFitMode mode);
+GridFitMode PreferGridFitMode();
+
+// Pixel-size cutoff (logical px/em) below which grid-fit hinting applies; at or above it
+// hinting is a no-op. Default 28. Clamped to a sane range.
+void  PreferGridFitMaxPx(float px);
+float PreferGridFitMaxPx();
+
+// Per-frame CPU render profile for the most recently completed frame. Lets a HUD
+// attribute frame cost to the morph outline blend vs. the rasterization submission,
+// and infer "GPU/other" as (wall-clock frame − blendMs − rasterMs). Timers are
+// CPU-side only, so a frame where blendMs+rasterMs is far below the frame time is
+// GPU-bound (fill/vsync); one where they dominate is CPU-bound (blend or GL submit).
+struct RenderProfile {
+    float blendMs  = 0.f;  // CPU time in the morph outline blend (cells, FT, reconstruct)
+    float rasterMs = 0.f;  // CPU time submitting glyph rasterization (recon + coverage draws)
+    int   glyphs   = 0;    // glyphs drawn through the fill path this frame
+    int   rebuilds = 0;    // morph cells (re)sampled this frame (0 = pure reuse/idle)
+};
+RenderProfile GetRenderProfile();
 
 RenderMode    GetRenderMode(const Face* face);
 void          SetRenderMode(Face* face, RenderMode mode);
@@ -206,6 +265,19 @@ void  ResetAxes(Face* face);
 // When allow_extrapolation=true, values beyond fvar min/max are clamped for
 // FreeType but a synthetic outline stretch is applied at render time.
 void  ApplyAxes(Face* face, bool allow_extrapolation = false);
+
+// ---------------------------------------------------------------------------
+// Axis morphing: re-rasterization-free variable-font interpolation.
+// When enabled (best paired with RenderMode::LoopBlinnLive), changing Axis::Value
+// no longer re-instances FreeType: the glyph outline is blended each frame from
+// a cached base outline plus per-axis main-effect deltas (O(axes), not 2^axes),
+// so dragging an axis is as cheap as moving a quad. You set Axis::Value directly
+// (no ApplyAxes needed) and the next AddText reflects it. Scales to high-axis
+// parametric fonts (e.g. Roboto Flex, 13 axes); inert axes are pruned per glyph.
+// allow_extrapolation lets Value exceed fvar min/max via linear continuation of
+// the outer master delta.
+void  EnableMorph(Face* face, bool enable, bool allow_extrapolation = false);
+bool  MorphEnabled(const Face* face);
 
 // ---------------------------------------------------------------------------
 // ImGui widgets

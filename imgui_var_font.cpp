@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <utility>
 #include <unordered_map>
@@ -38,93 +39,19 @@
 #include "misc/freetype/imgui_freetype.h"
 #endif
 
-#include "imvarfont_gl.h"
+#include "varfont_gl.h"
+#include "imgui_var_font_detail.h"
 
 namespace ImVarFont {
 
-// ============================================================================
-// Internal Face definition
-// ============================================================================
-
-struct FontMetadata {
-    std::string copyright;
-    std::string designer;
-    std::string manufacturer;
-    std::string fullName;
-    std::string version;
-    std::string trademark;
-    std::string description;
-    std::string license;
-    std::string licenseUrl;
-    std::string designerUrl;
-    std::string vendorUrl;
-    std::string postScriptName;
-    std::string uniqueId;
-};
-
-// ----------------------------------------------------------------------------
-// Curve-preserving glyph geometry (analytic renderer)
-//
-// Extracted once per (glyph, outlineGen) in RAW design units (FT_LOAD_NO_SCALE),
-// so it is fully scalable: the analytic coverage backend subdivides quadratics/
-// cubics to lines at the target device size on demand, and a future Loop-Blinn /
-// banding backend can consume the curves directly. Each segment carries its own
-// endpoints; FreeType contours are closed, so the segment soup is a set of
-// directed edges suitable for winding-correct coverage with no contour grouping.
-// ----------------------------------------------------------------------------
-enum class SegType : uint8_t { Line, Quad, Cubic };
-
-struct GlyphSeg {
-    SegType type;
-    ImVec2  p[4];  // Line: p[0..1]; Quad: p[0..2]; Cubic: p[0..3]
-};
-
-struct GlyphCurves {
-    std::vector<GlyphSeg> segs;
-    ImVec2 bboxMin {  1e30f,  1e30f };  // design-unit bounds (y-up)
-    ImVec2 bboxMax { -1e30f, -1e30f };
-    bool   empty() const { return segs.empty(); }
-};
-
-struct Face {
-    FT_Library         library    = nullptr;
-    FT_Face            ftFace     = nullptr;
-    std::string        filePath;
-    std::string        familyName;
-    std::string        styleName;
-    bool               isVariable = false;
-    std::vector<Axis>  axes;
-    std::vector<float> axisExtrap;  // synthetic extrap factor per axis (0 = none)
-    FontMetadata       metadata;
-    bool               hasKerningTable = false;
-    bool               hasGpos         = false;
-    bool               useKerning      = true;
-    bool               useHarfBuzz     = true;
-    bool               useKernTable    = true;
-    std::vector<FeatureSetting> features;  // active OpenType GSUB/GPOS features
-    RenderMode         renderMode      = RenderMode::Vector;
-    HintingFlags       hintingFlags    = HintingFlags::Native;
-    float              syncedEmPx      = -1.f;
-
-    // outlineGen is bumped whenever the outline shape changes (axes/mode/hinting),
-    // which invalidates every per-glyph cache below.
-    uint64_t                                outlineGen        = 0;
-
-    // Curve-preserving geometry cache for the analytic renderer. Size-independent
-    // (raw design units), keyed by glyph index, invalidated via curveCacheGen.
-    uint64_t                                curveCacheGen     = (uint64_t)-1;
-    std::unordered_map<FT_UInt, GlyphCurves> curveCache;
-
-    // GPU coverage textures, keyed by glyph index + device ppem + extrapolation
-    // bucket. Invalidated (textures deleted) whenever outlineGen changes.
-    uint64_t                                glyphTexCacheGen  = (uint64_t)-1;
-    std::unordered_map<uint64_t, glr::GlyphTex> glyphTexCache;
-
-#ifdef IMVARFONT_USE_HARFBUZZ
-    hb_font_t*         hbFont          = nullptr;
-    hb_buffer_t*       hbBuf           = nullptr;
-#endif
-};
+using detail::valueToFixed;
+using detail::extractCurves;
+using detail::pushEdge;
+using detail::flatQuad;
+using detail::flatCubic;
+using detail::rasterOutlineCPU;
+using detail::setFaceVarToCurrent;
+using detail::morphBlendGlyph;
 
 // ============================================================================
 // SFNT 'name' table helpers
@@ -529,9 +456,11 @@ HintingFlags GetHintingFlags(const Face* face) {
 
 const char* GetRenderModeLabel(RenderMode mode) {
     switch (mode) {
-    case RenderMode::HintedVector: return "Hinted vector";
-    case RenderMode::Raster:       return "Raster";
-    default:                       return "Vector";
+    case RenderMode::HintedVector:  return "Hinted vector";
+    case RenderMode::Raster:        return "Raster";
+    case RenderMode::LoopBlinn:     return "Loop-Blinn";
+    case RenderMode::LoopBlinnLive: return "Loop-Blinn (live)";
+    default:                        return "Vector";
     }
 }
 
@@ -585,9 +514,11 @@ static float computeAxisExtrap(float v, float min, float max, float def) {
     return 0.f;
 }
 
-static FT_Fixed valueToFixed(float v) {
+namespace detail {
+FT_Fixed valueToFixed(float v) {
     return (FT_Fixed)(v * 65536.f + (v >= 0.f ? 0.5f : -0.5f));
 }
+} // namespace detail
 
 void ApplyAxes(Face* f, bool allow_extrapolation) {
     if (!f || !f->ftFace || f->axes.empty()) return;
@@ -622,6 +553,45 @@ void ApplyAxes(Face* f, bool allow_extrapolation) {
     if (f->hbFont)
         hb_ft_font_changed(f->hbFont);
 #endif
+}
+
+// Resolve the face's vertical metrics (design units) once, at the font's DEFAULT
+// instance, and cache them for the lifetime of the face. Vertical metrics are a
+// font-level property; reading them at the live instance makes them track the
+// MVAR table, so dragging an axis would continuously shift ascender/descender/
+// height — reflowing the preview text and churning the metadata numbers. Freezing
+// them at the default keeps the layout stable across a morph and the displayed
+// metrics steady, which is the expected behaviour for a preview/morph tool. The
+// user's instance is restored before returning so nothing else is disturbed.
+static void resolveVMetrics(Face* f) {
+    if (!f || !f->ftFace || f->metricsValid) return;
+    const int n = (int)f->axes.size();
+    if (n > 0 && n <= kMorphMaxAxes) {
+        FT_Fixed def[kMorphMaxAxes], cur[kMorphMaxAxes];
+        for (int i = 0; i < n; ++i) {
+            def[i] = valueToFixed(f->axes[i].Default);
+            cur[i] = valueToFixed(std::clamp(f->axes[i].Value,
+                                             f->axes[i].Min, f->axes[i].Max));
+        }
+        FT_Set_Var_Design_Coordinates(f->ftFace, (FT_UInt)n, def);
+        f->metricAsc     = (int)f->ftFace->ascender;
+        f->metricDesc    = (int)f->ftFace->descender;
+        f->metricHeight  = (int)f->ftFace->height;
+        f->metricBbox[0] = (long)f->ftFace->bbox.xMin;
+        f->metricBbox[1] = (long)f->ftFace->bbox.yMin;
+        f->metricBbox[2] = (long)f->ftFace->bbox.xMax;
+        f->metricBbox[3] = (long)f->ftFace->bbox.yMax;
+        FT_Set_Var_Design_Coordinates(f->ftFace, (FT_UInt)n, cur);   // restore user instance
+    } else {
+        f->metricAsc     = (int)f->ftFace->ascender;
+        f->metricDesc    = (int)f->ftFace->descender;
+        f->metricHeight  = (int)f->ftFace->height;
+        f->metricBbox[0] = (long)f->ftFace->bbox.xMin;
+        f->metricBbox[1] = (long)f->ftFace->bbox.yMin;
+        f->metricBbox[2] = (long)f->ftFace->bbox.xMax;
+        f->metricBbox[3] = (long)f->ftFace->bbox.yMax;
+    }
+    f->metricsValid = true;
 }
 
 // ============================================================================
@@ -671,8 +641,8 @@ bool AxisSliders(Face* face, const char* str_id, bool allow_extrapolation) {
         ResetAxes(face);
         changed = true;
     }
-    if (changed)
-        ApplyAxes(face, allow_extrapolation);
+    if (changed && !face->morphEnabled)
+        ApplyAxes(face, allow_extrapolation);   // morph reads Axis::Value directly
     ImGui::PopID();
     return changed;
 }
@@ -685,6 +655,7 @@ void MetadataTable(const Face* face) {
 
     const FT_Face ft = face->ftFace;
     const auto&   m  = face->metadata;
+    resolveVMetrics(const_cast<Face*>(face));   // stable, instance-independent metrics
 
     ImGui::TextDisabled("Identity");
     ImGui::Spacing();
@@ -706,13 +677,14 @@ void MetadataTable(const Face* face) {
     ImGui::TextDisabled("Metrics");
     ImGui::Spacing();
     ImGui::Text("UPM    : %d", ft->units_per_EM);
-    ImGui::Text("Asc    : %d", ft->ascender);
-    ImGui::Text("Desc   : %d", ft->descender);
-    ImGui::Text("Height : %d", ft->height);
-    if (ft->bbox.xMin || ft->bbox.yMin || ft->bbox.xMax || ft->bbox.yMax) {
+    ImGui::Text("Asc    : %d", face->metricAsc);
+    ImGui::Text("Desc   : %d", face->metricDesc);
+    ImGui::Text("Height : %d", face->metricHeight);
+    if (face->metricBbox[0] || face->metricBbox[1] ||
+        face->metricBbox[2] || face->metricBbox[3]) {
         ImGui::Text("BBox   : %ld %ld  %ld %ld",
-                    (long)ft->bbox.xMin, (long)ft->bbox.yMin,
-                    (long)ft->bbox.xMax, (long)ft->bbox.yMax);
+                    face->metricBbox[0], face->metricBbox[1],
+                    face->metricBbox[2], face->metricBbox[3]);
     }
 
     if (!m.copyright.empty() || !m.designer.empty() || !m.manufacturer.empty() ||
@@ -882,7 +854,11 @@ static const FT_Outline_Funcs kCurveExtractFuncs = {
     cx_moveto, cx_lineto, cx_conicto, cx_cubicto, 0, 0
 };
 
-static void extractCurves(const FT_Outline* ol, GlyphCurves& out) {
+} // anonymous namespace (curve extract helpers)
+
+namespace detail {
+
+void extractCurves(const FT_Outline* ol, GlyphCurves& out) {
     out.segs.clear();
     out.bboxMin = ImVec2( 1e30f,  1e30f);
     out.bboxMax = ImVec2(-1e30f, -1e30f);
@@ -890,6 +866,8 @@ static void extractCurves(const FT_Outline* ol, GlyphCurves& out) {
     FT_Outline_Decompose(const_cast<FT_Outline*>(ol), &kCurveExtractFuncs, &ctx);
     ctx.closeContour();
 }
+
+} // namespace detail
 
 // Cached design-unit curves (vector pipeline; size-independent). Invalidated by
 // outlineGen. Hinted outlines are size-specific and are extracted fresh instead.
@@ -909,12 +887,15 @@ static const GlyphCurves& getCurvesCached(Face* face, FT_UInt gi, const FT_Outli
 static inline ImVec2 segMid(const ImVec2& a, const ImVec2& b) {
     return ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
 }
-static inline void pushEdge(std::vector<float>& E, const ImVec2& a, const ImVec2& b) {
+
+namespace detail {
+
+void pushEdge(std::vector<float>& E, const ImVec2& a, const ImVec2& b) {
     E.push_back(a.x); E.push_back(a.y); E.push_back(b.x); E.push_back(b.y);
 }
 
 // Adaptive flattening in cell-pixel space (tolSq = chord-deviation² in px²).
-static void flatQuad(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2,
+void flatQuad(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2,
                      float tolSq, int depth) {
     const float dx = p2.x - p0.x, dy = p2.y - p0.y;
     const float cross = (p1.x - p2.x) * dy - (p1.y - p2.y) * dx;
@@ -929,7 +910,7 @@ static void flatQuad(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2,
     flatQuad(E, p0, p01, p012, tolSq, depth + 1);
     flatQuad(E, p012, p12, p2, tolSq, depth + 1);
 }
-static void flatCubic(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2, ImVec2 p3,
+void flatCubic(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2, ImVec2 p3,
                       float tolSq, int depth) {
     const float dx = p3.x - p0.x, dy = p3.y - p0.y;
     const float d1 = std::fabs((p1.x - p3.x) * dy - (p1.y - p3.y) * dx);
@@ -949,11 +930,44 @@ static void flatCubic(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2, Im
     flatCubic(E, p0123, p123, p23, p3, tolSq, depth + 1);
 }
 
+} // namespace detail
+
+// Approximate a cubic Bezier with analytic quadratics for the Loop-Blinn path
+// (smooth at any zoom, unlike line flattening). Adaptive by device-pixel
+// tolerance via the |third difference| error bound; each piece uses the standard
+// single-quad control point. Subdivision is at t=0.5, so every output control
+// point is a fixed linear combination of the input ones — this keeps the result
+// linear in the cubic's control points, which the axis-morph blend relies on
+// (provided the subdivision count is held fixed; see lattice sampling).
+static void cubicToQuads(std::vector<glr::Curve>& out,
+                         ImVec2 p0, ImVec2 p1, ImVec2 p2, ImVec2 p3,
+                         float tolPx, int depth) {
+    const float dx = p0.x - 3.f * p1.x + 3.f * p2.x - p3.x;
+    const float dy = p0.y - 3.f * p1.y + 3.f * p2.y - p3.y;
+    const float err = 0.0481125f * std::sqrt(dx * dx + dy * dy);   // sqrt(3)/36
+    if (depth >= 12 || err <= tolPx) {
+        glr::Curve c; c.type = 2;
+        c.p[0] = p0.x; c.p[1] = p0.y;
+        c.p[2] = (3.f * (p1.x + p2.x) - (p0.x + p3.x)) * 0.25f;
+        c.p[3] = (3.f * (p1.y + p2.y) - (p0.y + p3.y)) * 0.25f;
+        c.p[4] = p3.x; c.p[5] = p3.y;
+        out.push_back(c);
+        return;
+    }
+    const ImVec2 p01 = segMid(p0, p1), p12 = segMid(p1, p2), p23 = segMid(p2, p3);
+    const ImVec2 p012 = segMid(p01, p12), p123 = segMid(p12, p23);
+    const ImVec2 p0123 = segMid(p012, p123);
+    cubicToQuads(out, p0, p01, p012, p0123, tolPx, depth + 1);
+    cubicToQuads(out, p0123, p123, p23, p3, tolPx, depth + 1);
+}
+
+namespace detail {
+
 // CPU coverage fallback (used when the GPU analytic path is unavailable, e.g.
 // OpenGL ES 2 / WebGL1). Rasterizes the outline with FreeType's smooth renderer
 // into a w*h, top-down, 8-bit coverage bitmap, transformed into the SAME device
 // cell the GPU path uses (pad, y-flip, scale), so the composited result matches.
-static bool rasterOutlineCPU(FT_Library lib, const FT_Outline* ol,
+bool rasterOutlineCPU(FT_Library lib, const FT_Outline* ol,
                              int w, int h, float sx, float sy,
                              float bx0, float by1, int pad,
                              std::vector<unsigned char>& a8) {
@@ -993,10 +1007,794 @@ static bool rasterOutlineCPU(FT_Library lib, const FT_Outline* ol,
     return FT_Outline_Get_Bitmap(lib, &oc, &bmp) == 0;
 }
 
+} // namespace detail
+
+// ============================================================================
+// Knot-lattice axis morphing (O(N) main-effects form)
+//
+// Within an axis "cell" free of variation knots, every OpenType region scalar is
+// linear, so the summed outline is multilinear there. The full multilinear blend
+// needs 2^N corners; instead we sample the base + N single-axis "main-effect"
+// deltas (O(N)), reconstruct additively, and bound the residual cross-axis
+// coupling by adaptive cell refinement (FreeType is the authoritative reference). This scales to
+// high-axis parametric fonts (Roboto Flex, 13 axes) where 2^N is hopeless.
+// Dragging an axis is then a cheap blend of cached control points; we re-sample
+// only when the axis vector leaves the cell.
+//
+// We work in FreeType's normalized BLEND space (post-avar), so the avar remap is
+// absorbed at sample time. To stay exact even for fonts with INTERIOR masters
+// (region peaks at non-±1 coords), the cell is refined adaptively: starting from
+// the {-1,0}/{0,1} bracket we bisect toward the current point until a center probe
+// matches FreeType within tolerance — i.e. until the cell is knot-free. FreeType
+// is the authoritative reference, so this is font-agnostic and cannot silently drift.
+// ============================================================================
+
+// Fill norm[] with the current axis values mapped to FreeType's normalized BLEND
+// coordinates ([-1,1], post-avar). We do the cell/blend math in this space (not
+// design units) so the avar remap is absorbed by FreeType at sample time and the
+// blend stays linear where the region scalars are — eliminating avar drift.
+static void currentBlendCoords(Face* f, float* norm) {
+    const int n = (int)f->axes.size();
+    std::vector<FT_Fixed> d((size_t)n), b((size_t)n);
+    for (int i = 0; i < n; ++i)
+        d[i] = valueToFixed(std::clamp(f->axes[i].Value, f->axes[i].Min, f->axes[i].Max));
+    FT_Set_Var_Design_Coordinates(f->ftFace, (FT_UInt)n, d.data());
+    FT_Get_Var_Blend_Coordinates(f->ftFace, (FT_UInt)n, b.data());
+    for (int i = 0; i < n; ++i)
+        norm[i] = (float)b[i] / 65536.f;
+}
+
+static inline int segPts(SegType t) {
+    return (t == SegType::Line) ? 2 : (t == SegType::Quad) ? 3 : 4;
+}
+
+// Sample a glyph outline + advance at one blend-space coordinate vector.
+// This is the only FreeType ground-truth sample call; everything else is a CPU blend.
+static bool sampleOutlineAt(Face* f, FT_UInt gi, int n, const float* coord,
+                            GlyphCurves& out, float& adv) {
+    ++f->morphFtSamples;
+    std::vector<FT_Fixed> c((size_t)n);
+    for (int i = 0; i < n; ++i) c[i] = valueToFixed(coord[i]);
+    FT_Set_Var_Blend_Coordinates(f->ftFace, (FT_UInt)n, c.data());
+    if (FT_Load_Glyph(f->ftFace, gi, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING) != 0)
+        return false;
+    adv = (float)f->ftFace->glyph->advance.x;
+    out.segs.clear();
+    if (f->ftFace->glyph->format == FT_GLYPH_FORMAT_OUTLINE)
+        extractCurves(&f->ftFace->glyph->outline, out);
+    return true;
+}
+
+// Sample base (all axes at lo) + each axis's main-effect delta (that axis at hi,
+// the rest at lo) for the bracket [lo,hi]. Axes whose delta is below the noise
+// floor are marked inactive so they cost nothing and never trigger a re-sample.
+// O(active axes + 1) FreeType loads instead of the 2^n full corner lattice.
+static bool sampleLinearCell(Face* f, FT_UInt gi, int n,
+                             const float* lo, const float* hi,
+                             MorphGlyphCell& cell, float activeEps,
+                             bool refineMask = false) {
+    // On refinement re-samples we already know which axes the glyph responds to
+    // in this region: an axis whose main-effect delta is below the noise floor
+    // over the full bracket stays inert in any sub-bracket (the response is
+    // linear within a knot-free cell, so halving the bracket halves the delta),
+    // and reconstructBlend skips inactive axes outright. So we sample only the
+    // known-active axes' deltas and skip a FreeType load for each inert axis —
+    // the dominant cost on high-axis parametric fonts where most axes don't move
+    // a given glyph.
+    bool wasActive[kMorphMaxAxes];
+    if (refineMask)
+        for (int i = 0; i < n; ++i) wasActive[i] = cell.active[i];
+
+    float coord[kMorphMaxAxes];
+    for (int i = 0; i < n; ++i) coord[i] = lo[i];
+    if (!sampleOutlineAt(f, gi, n, coord, cell.base, cell.baseAdv)) return false;
+
+    cell.delta.assign((size_t)n, GlyphCurves{});
+    cell.deltaAdv.assign((size_t)n, 0.f);
+    for (int i = 0; i < n; ++i) cell.active[i] = false;
+    if (cell.base.segs.empty()) return true;   // empty glyph (e.g. space)
+
+    for (int i = 0; i < n; ++i) {
+        if (hi[i] == lo[i]) continue;          // zero-width axis: inert here
+        if (refineMask && !wasActive[i]) continue;   // known inert -> stays inert (frac=0)
+        coord[i] = hi[i];
+        GlyphCurves pi; float adv = 0.f;
+        const bool okSample = sampleOutlineAt(f, gi, n, coord, pi, adv);
+        coord[i] = lo[i];
+        if (!okSample) return false;
+        if (pi.segs.size() != cell.base.segs.size()) return false;  // topology guard
+
+        GlyphCurves& d = cell.delta[i];
+        d.segs.assign(cell.base.segs.size(), GlyphSeg{});
+        float mx = 0.f;
+        for (size_t s = 0; s < d.segs.size(); ++s) {
+            if (pi.segs[s].type != cell.base.segs[s].type) return false;
+            d.segs[s].type = cell.base.segs[s].type;
+            const int np = (d.segs[s].type == SegType::Line) ? 2
+                         : (d.segs[s].type == SegType::Quad) ? 3 : 4;
+            for (int j = 0; j < np; ++j) {
+                const float dx = pi.segs[s].p[j].x - cell.base.segs[s].p[j].x;
+                const float dy = pi.segs[s].p[j].y - cell.base.segs[s].p[j].y;
+                d.segs[s].p[j] = ImVec2(dx, dy);
+                mx = ImMax(mx, ImMax(std::fabs(dx), std::fabs(dy)));
+            }
+        }
+        cell.deltaAdv[i] = adv - cell.baseAdv;
+        // An axis found relevant at the wide bracket must stay active through
+        // refinement: halving shrinks its delta, so it can dip below activeEps, but
+        // declassifying it to inert sets its reuse bracket to the full axis and the
+        // cell would then be reused (frozen at base) while that axis is dragged.
+        cell.active[i]   = (mx > activeEps) || (refineMask && wasActive[i]);
+    }
+    return true;
+}
+
+// Sample the kept order-2 pair corners for the bracket [lo,hi] and form the
+// interaction deltas Δ_ij = P(e_i+e_j) - P(e_i) - P(e_j) + base (the mixed second
+// difference). Requires base + per-axis deltas already sampled. A pair whose
+// endpoints are degenerate falls back to a zero term (harmless).
+static bool sampleCellPairs(Face* f, FT_UInt gi, int n,
+                            const float* lo, const float* hi, MorphGlyphCell& cell) {
+    const size_t np = cell.pairs.size();
+    cell.pairDelta.assign(np, GlyphCurves{});
+    cell.pairAdv.assign(np, 0.f);
+    const size_t segN = cell.base.segs.size();
+    if (segN == 0) return true;
+
+    float coord[kMorphMaxAxes];
+    for (int i = 0; i < n; ++i) coord[i] = lo[i];
+    for (size_t k = 0; k < np; ++k) {
+        const int i = cell.pairs[k].i, j = cell.pairs[k].j;
+        GlyphCurves& d = cell.pairDelta[k];
+        d.segs.assign(segN, GlyphSeg{});
+        for (size_t s = 0; s < segN; ++s) d.segs[s].type = cell.base.segs[s].type;
+
+        const GlyphCurves& di = cell.delta[i];
+        const GlyphCurves& dj = cell.delta[j];
+        if (di.segs.size() != segN || dj.segs.size() != segN)
+            continue;                               // axis degenerate here -> zero term
+
+        coord[i] = hi[i]; coord[j] = hi[j];
+        GlyphCurves pij; float adv = 0.f;
+        const bool ok = sampleOutlineAt(f, gi, n, coord, pij, adv);
+        coord[i] = lo[i]; coord[j] = lo[j];
+        if (!ok || pij.segs.size() != segN) return false;
+
+        for (size_t s = 0; s < segN; ++s) {
+            if (pij.segs[s].type != cell.base.segs[s].type) return false;
+            const int q = segPts(d.segs[s].type);
+            for (int p = 0; p < q; ++p) {
+                d.segs[s].p[p].x = pij.segs[s].p[p].x - cell.base.segs[s].p[p].x
+                                 - di.segs[s].p[p].x - dj.segs[s].p[p].x;
+                d.segs[s].p[p].y = pij.segs[s].p[p].y - cell.base.segs[s].p[p].y
+                                 - di.segs[s].p[p].y - dj.segs[s].p[p].y;
+            }
+        }
+        cell.pairAdv[k] = adv - cell.baseAdv - cell.deltaAdv[i] - cell.deltaAdv[j];
+    }
+    return true;
+}
+
+// Largest |component| of an interaction delta (font units) — used to prune pairs.
+static float curvesMaxAbs(const GlyphCurves& g) {
+    float mx = 0.f;
+    for (const GlyphSeg& sg : g.segs) {
+        const int q = segPts(sg.type);
+        for (int p = 0; p < q; ++p)
+            mx = ImMax(mx, ImMax(std::fabs(sg.p[p].x), std::fabs(sg.p[p].y)));
+    }
+    return mx;
+}
+
+static void recomputeBbox(GlyphCurves& g) {
+    g.bboxMin = ImVec2( 1e30f,  1e30f);
+    g.bboxMax = ImVec2(-1e30f, -1e30f);
+    for (const GlyphSeg& sg : g.segs) {
+        const int np = (sg.type == SegType::Line) ? 2 : (sg.type == SegType::Quad) ? 3 : 4;
+        for (int j = 0; j < np; ++j) {
+            g.bboxMin.x = ImMin(g.bboxMin.x, sg.p[j].x);
+            g.bboxMin.y = ImMin(g.bboxMin.y, sg.p[j].y);
+            g.bboxMax.x = ImMax(g.bboxMax.x, sg.p[j].x);
+            g.bboxMax.y = ImMax(g.bboxMax.y, sg.p[j].y);
+        }
+    }
+}
+
+// out = base + Σ_i frac_i·Δ_i + Σ_pairs frac_i·frac_j·Δ_ij. The order-1
+// main-effects part is O(active axes); the order-2 part adds the few kept coupled
+// pairs (usually empty). Cross-axis coupling beyond the kept pairs and any knots
+// are handled by adaptive cell refinement.
+static void reconstructBlend(const MorphGlyphCell& cell, int n,
+                             const float* frac, GlyphCurves& out, float* advOut) {
+    out.segs = cell.base.segs;
+    float adv = cell.baseAdv;
+    for (int i = 0; i < n; ++i) {
+        if (!cell.active[i]) continue;
+        const float fr = frac[i];
+        if (fr == 0.f) continue;
+        adv += fr * cell.deltaAdv[i];
+        const GlyphCurves& d = cell.delta[i];
+        for (size_t s = 0; s < out.segs.size(); ++s) {
+            const int q = segPts(out.segs[s].type);
+            for (int j = 0; j < q; ++j) {
+                out.segs[s].p[j].x += fr * d.segs[s].p[j].x;
+                out.segs[s].p[j].y += fr * d.segs[s].p[j].y;
+            }
+        }
+    }
+    for (size_t k = 0; k < cell.pairs.size(); ++k) {
+        const float w = frac[cell.pairs[k].i] * frac[cell.pairs[k].j];
+        if (w == 0.f) continue;
+        adv += w * cell.pairAdv[k];
+        const GlyphCurves& d = cell.pairDelta[k];
+        if (d.segs.size() != out.segs.size()) continue;
+        for (size_t s = 0; s < out.segs.size(); ++s) {
+            const int q = segPts(out.segs[s].type);
+            for (int j = 0; j < q; ++j) {
+                out.segs[s].p[j].x += w * d.segs[s].p[j].x;
+                out.segs[s].p[j].y += w * d.segs[s].p[j].y;
+            }
+        }
+    }
+    recomputeBbox(out);
+    if (advOut) *advOut = adv;
+}
+
+// Bbox + advance ONLY, without materializing the blended outline. Used when the
+// GPU reconstructs base + Σ weight·delta itself: the CPU just needs the cell's
+// tight design-unit bounds (for cell size/placement) and the blended advance (for
+// layout), so we accumulate each control point's blended position into a reused
+// scratch buffer (axis-outer, like reconstructBlend, for cache-friendly delta
+// access) and min/max it — skipping the per-frame GlyphCurves seg copy/maintenance
+// the full blend would do. Bounds match reconstructBlend exactly (same weights),
+// so the GPU geometry lands in exactly this cell.
+static void reconstructBboxAdv(const MorphGlyphCell& cell, int n, const float* frac,
+                               ImVec2& bbMin, ImVec2& bbMax, float* advOut) {
+    static std::vector<ImVec2> scratch;   // reused across calls (single-threaded path)
+    const auto& bsegs = cell.base.segs;
+
+    // Flatten base control points into the scratch buffer.
+    size_t total = 0;
+    for (const GlyphSeg& s : bsegs) total += (size_t)segPts(s.type);
+    scratch.resize(total);
+    {
+        size_t o = 0;
+        for (const GlyphSeg& s : bsegs) {
+            const int q = segPts(s.type);
+            for (int j = 0; j < q; ++j) scratch[o++] = s.p[j];
+        }
+    }
+
+    float adv = cell.baseAdv;
+    for (int i = 0; i < n; ++i) {
+        if (!cell.active[i]) continue;
+        const float fr = frac[i];
+        if (fr == 0.f) continue;
+        adv += fr * cell.deltaAdv[i];
+        const GlyphCurves& d = cell.delta[i];
+        if (d.segs.size() != bsegs.size()) continue;
+        size_t o = 0;
+        for (size_t s = 0; s < bsegs.size(); ++s) {
+            const int q = segPts(bsegs[s].type);
+            for (int j = 0; j < q; ++j, ++o) {
+                scratch[o].x += fr * d.segs[s].p[j].x;
+                scratch[o].y += fr * d.segs[s].p[j].y;
+            }
+        }
+    }
+    for (size_t k = 0; k < cell.pairs.size(); ++k) {
+        const float w = frac[cell.pairs[k].i] * frac[cell.pairs[k].j];
+        if (w == 0.f) continue;
+        adv += w * cell.pairAdv[k];
+        const GlyphCurves& d = cell.pairDelta[k];
+        if (d.segs.size() != bsegs.size()) continue;
+        size_t o = 0;
+        for (size_t s = 0; s < bsegs.size(); ++s) {
+            const int q = segPts(bsegs[s].type);
+            for (int j = 0; j < q; ++j, ++o) {
+                scratch[o].x += w * d.segs[s].p[j].x;
+                scratch[o].y += w * d.segs[s].p[j].y;
+            }
+        }
+    }
+
+    bbMin = ImVec2( 1e30f,  1e30f);
+    bbMax = ImVec2(-1e30f, -1e30f);
+    for (const ImVec2& p : scratch) {
+        bbMin.x = ImMin(bbMin.x, p.x); bbMin.y = ImMin(bbMin.y, p.y);
+        bbMax.x = ImMax(bbMax.x, p.x); bbMax.y = ImMax(bbMax.y, p.y);
+    }
+    if (advOut) *advOut = adv;
+}
+
+// Incrementally move the live blend 'g' from frac 'oldFrac' to 'newFrac' by adding
+// (newFrac_i - oldFrac_i)·Δ_i for the axes that changed, plus the change in each
+// kept pair's bilinear weight·Δ_ij. Exactly preserves g = reconstructBlend(frac)
+// (modulo float rounding) but only touches the axes that actually moved -> a
+// single-axis drag is O(points + pairs-with-that-axis), independent of axis count.
+static void applyFracDelta(const MorphGlyphCell& cell, int n, GlyphCurves& g,
+                           const float* oldFrac, const float* newFrac,
+                           float& adv) {
+    bool moved = false;
+    for (int i = 0; i < n; ++i) {
+        if (!cell.active[i]) continue;
+        const float df = newFrac[i] - oldFrac[i];
+        if (df == 0.f) continue;
+        moved = true;
+        adv += df * cell.deltaAdv[i];
+        const GlyphCurves& d = cell.delta[i];
+        for (size_t s = 0; s < g.segs.size(); ++s) {
+            const int q = segPts(g.segs[s].type);
+            for (int j = 0; j < q; ++j) {
+                g.segs[s].p[j].x += df * d.segs[s].p[j].x;
+                g.segs[s].p[j].y += df * d.segs[s].p[j].y;
+            }
+        }
+    }
+    for (size_t k = 0; k < cell.pairs.size(); ++k) {
+        const int i = cell.pairs[k].i, j = cell.pairs[k].j;
+        const float dw = newFrac[i] * newFrac[j] - oldFrac[i] * oldFrac[j];
+        if (dw == 0.f) continue;
+        const GlyphCurves& d = cell.pairDelta[k];
+        if (d.segs.size() != g.segs.size()) continue;
+        moved = true;
+        adv += dw * cell.pairAdv[k];
+        for (size_t s = 0; s < g.segs.size(); ++s) {
+            const int q = segPts(g.segs[s].type);
+            for (int p = 0; p < q; ++p) {
+                g.segs[s].p[p].x += dw * d.segs[s].p[p].x;
+                g.segs[s].p[p].y += dw * d.segs[s].p[p].y;
+            }
+        }
+    }
+    if (moved) recomputeBbox(g);
+}
+
+static float curvesMaxErr(const GlyphCurves& a, const GlyphCurves& b) {
+    if (a.segs.size() != b.segs.size()) return 1e30f;
+    float mx = 0.f;
+    for (size_t s = 0; s < a.segs.size(); ++s) {
+        if (a.segs[s].type != b.segs[s].type) return 1e30f;
+        const int np = (a.segs[s].type == SegType::Line) ? 2
+                     : (a.segs[s].type == SegType::Quad) ? 3 : 4;
+        for (int j = 0; j < np; ++j) {
+            const float dx = a.segs[s].p[j].x - b.segs[s].p[j].x;
+            const float dy = a.segs[s].p[j].y - b.segs[s].p[j].y;
+            mx = ImMax(mx, std::sqrt(dx * dx + dy * dy));
+        }
+    }
+    return mx;
+}
+
+static void restoreUserInstance(Face* f) {
+    const int n = (int)f->axes.size();
+    std::vector<FT_Fixed> d((size_t)n);
+    for (int i = 0; i < n; ++i)
+        d[i] = valueToFixed(std::clamp(f->axes[i].Value, f->axes[i].Min, f->axes[i].Max));
+    FT_Set_Var_Design_Coordinates(f->ftFace, (FT_UInt)n, d.data());
+}
+
+// Normalized blend coords are identical for every glyph at a given axis vector, so
+// resolve them through FreeType once and cache on the face; only the first glyph
+// after an axis change pays the FT round-trip.
+static const float* cachedBlendCoords(Face* f, int n) {
+    if (f->morphNormValid && f->morphNormN == n) {
+        bool same = true;
+        for (int i = 0; i < n; ++i)
+            if (f->axes[i].Value != f->morphNormVals[i]) { same = false; break; }
+        if (same) return f->morphNorm;
+    }
+    currentBlendCoords(f, f->morphNorm);
+    for (int i = 0; i < n; ++i) f->morphNormVals[i] = f->axes[i].Value;
+    f->morphNormN = n;
+    f->morphNormValid = true;
+    return f->morphNorm;
+}
+
+// ── Per-frame render profiler ─────────────────────────────────────────────────
+// Lightweight CPU timers so the example can attribute a frame's cost to the morph
+// outline blend vs. the rasterization submission, and infer "GPU/other" as the
+// remainder of the wall-clock frame. The accumulators reset on the first glyph of
+// each ImGui frame; GetRenderProfile() returns the last completed frame's totals.
+// These measure CPU time only (the GPU runs the coverage/recon draws asynchronously),
+// which is exactly what we need to separate a CPU-bound frame from a GPU-bound one.
+namespace {
+    using ProfClock = std::chrono::high_resolution_clock;
+    struct ProfAccum { double blendMs = 0.0, rasterMs = 0.0; int glyphs = 0, rebuilds = 0; };
+    ProfAccum s_prof, s_profLast;
+    int s_profFrame = -1;
+    inline void profFrameTick() {
+        const int fr = ImGui::GetFrameCount();
+        if (fr != s_profFrame) { s_profLast = s_prof; s_prof = ProfAccum{}; s_profFrame = fr; }
+    }
+    inline double profMsSince(ProfClock::time_point t) {
+        return std::chrono::duration<double, std::milli>(ProfClock::now() - t).count();
+    }
+}
+
+// Build / reuse a knot-free cell for this glyph, then blend it at the current axis
+// vector and return a pointer to the cached blended outline (nullptr on failure).
+// Re-samples (and adaptively refines) only when the vector leaves the cached cell;
+// within the cell, dragging is a pure CPU blend (no FreeType calls) and updates
+// only the axes that changed since the previous frame.
+// Opt-in: reconstruct morph glyphs on the GPU (base + Σ frac·delta) instead of
+// CPU-blending + re-uploading curves each frame. Default off so the proven path is
+// the baseline; the example exposes a toggle for A/B.
+static bool s_preferGpuMorph = false;
+
+// Grid-fit (small-size hinting) state. See PreferGridFit() in the header. When enabled,
+// glyphs below the pixel-size cutoff are rendered through FreeType's own autohinter +
+// grayscale raster (GridFitMode::FreeType); at/above the cutoff it is a no-op. The cutoff
+// is caller-tunable so an app can match its smallest text size.
+static bool        s_gridFit       = false;
+static GridFitMode s_gridFitMode   = GridFitMode::FreeType;  // mode when enabled
+static float       s_gridFitMaxEmPx = 28.f;   // logical px/em; at/above this -> no-op
+
+namespace detail {
+
+const GlyphCurves* morphBlendGlyph(Face* f, FT_UInt gi, float* advOut,
+                                          MorphGlyphCell** outCell) {
+    const int n = (int)f->axes.size();
+    if (n <= 0 || n > kMorphMaxAxes) return nullptr;
+
+    const float* norm = cachedBlendCoords(f, n);
+
+    bool extrapActive = false;
+    if (f->morphExtrap)
+        for (int i = 0; i < n; ++i) {
+            const Axis& ax = f->axes[i];
+            if (ax.Value > ax.Max + 1e-6f || ax.Value < ax.Min - 1e-6f) { extrapActive = true; break; }
+        }
+
+    MorphGlyphCell& cell = f->morphCache[gi];
+    if (outCell) *outCell = &cell;
+
+    bool reuse = cell.ok && cell.n == n && cell.builtExtrap == extrapActive;
+    if (reuse)
+        for (int i = 0; i < n; ++i) {
+            // Brackets are signed (base==lo is the build vector, hi the far end), so
+            // the reuse region is [min(lo,hi), max(lo,hi)].
+            const float a = ImMin(cell.lo[i], cell.hi[i]), b = ImMax(cell.lo[i], cell.hi[i]);
+            if (norm[i] < a - 1e-4f || norm[i] > b + 1e-4f) { reuse = false; break; }
+        }
+
+    if (!reuse) {
+        ++f->morphCellBuilds;
+        ++s_prof.rebuilds;
+        const int   upm = f->ftFace->units_per_EM ? (int)f->ftFace->units_per_EM : 1000;
+        const float tol = 0.001f * (float)upm;   // ~0.1% em; FT rounding is the floor
+        const float activeEps = 0.25f;           // font units; below FT rounding -> inert axis
+        const int   maxDepth = 12;
+
+        // Anchor the base at the CURRENT vector (lo = norm) and extend the bracket
+        // toward the farther adjacent master (+1 or -1). This makes the reused cell a
+        // local linearization around where the user is: a single-axis drag moves only
+        // that axis off frac=0 while the others stay at the base (frac=0), so the
+        // bilinear cross-axis coupling — which previously dominated drags because the
+        // non-dragged axes sat at a bracket corner (frac=1) — drops out entirely.
+        // (The old master-anchored half-axis cell validated only its center, so reuse
+        // toward the corners drifted hundreds of units and glyphs visibly lagged.)
+        float lo[kMorphMaxAxes], hi[kMorphMaxAxes];
+        for (int i = 0; i < n; ++i) {
+            if (extrapActive) {   // master-anchored half-axis (extrap continuation needs it)
+                if (norm[i] <= 0.f) { lo[i] = -1.f; hi[i] = 0.f; }
+                else                { lo[i] =  0.f; hi[i] = 1.f; }
+            } else {
+                lo[i] = norm[i];                                       // base = query (frac 0)
+                hi[i] = (1.f - norm[i] >= norm[i] + 1.f) ? 1.f : -1.f; // toward farther master
+            }
+        }
+        cell.pairs.clear(); cell.pairDelta.clear(); cell.pairAdv.clear();
+        if (!sampleLinearCell(f, gi, n, lo, hi, cell, activeEps)) {
+            restoreUserInstance(f); cell.ok = false; return nullptr;
+        }
+
+        if (!extrapActive && !cell.base.segs.empty()) {
+            const size_t segN = cell.base.segs.size();
+
+            // (1) Per-axis (anisotropic) refinement. With the base anchored at the
+            // current vector, a single-axis drag moves only that axis off frac=0 while
+            // the others stay at the base — so each axis's reuse accuracy depends
+            // solely on ITS OWN 1D nonlinearity over its bracket, with no cross-axis
+            // coupling to confound a per-axis criterion (the very coupling that forced
+            // the old master-anchored cell to refine every axis together). We shrink
+            // each active axis's bracket toward the base only until its midpoint probe
+            // (that axis at frac 0.5, others at base) is sub-pixel, then re-sample just
+            // that axis's delta. This keeps every bracket as wide as its own curvature
+            // allows -> the fewest cell rebuilds while dragging, still sub-pixel exact.
+            auto resampleDelta = [&](int i) -> bool {
+                float coord[kMorphMaxAxes];
+                for (int k = 0; k < n; ++k) coord[k] = lo[k];
+                coord[i] = hi[i];
+                GlyphCurves pi; float adv = 0.f;
+                if (!sampleOutlineAt(f, gi, n, coord, pi, adv) || pi.segs.size() != segN)
+        return false;
+                GlyphCurves& d = cell.delta[i];
+                for (size_t s = 0; s < segN; ++s) {
+                    if (pi.segs[s].type != cell.base.segs[s].type) return false;
+                    const int q = segPts(cell.base.segs[s].type);
+                    for (int j = 0; j < q; ++j) {
+                        d.segs[s].p[j].x = pi.segs[s].p[j].x - cell.base.segs[s].p[j].x;
+                        d.segs[s].p[j].y = pi.segs[s].p[j].y - cell.base.segs[s].p[j].y;
+                    }
+                }
+                cell.deltaAdv[i] = adv - cell.baseAdv;
+                return true;
+            };
+            // The chord fit is exact at the endpoints (base and the re-sampled hi), so
+            // the midpoint is the natural single probe for the bracket's nonlinearity;
+            // a knot inside the bracket bends the response away from the chord there and
+            // is bisected out. (A multi-fraction probe set is supported but measured no
+            // better on Roboto Flex while costing proportionally more FreeType loads.)
+            static const float kProbeFr[] = { 0.5f };
+            for (int i = 0; i < n; ++i) {
+                if (!cell.active[i]) continue;
+                for (int depth = 0; depth < maxDepth; ++depth) {
+                    const GlyphCurves& d = cell.delta[i];
+                    float err = 0.f;
+                    for (float pf : kProbeFr) {
+                        float coord[kMorphMaxAxes];
+                        for (int k = 0; k < n; ++k) coord[k] = lo[k];
+                        coord[i] = lo[i] + pf * (hi[i] - lo[i]);   // axis i probe, others at base
+                        GlyphCurves tC; float tadv = 0.f;
+                        if (!sampleOutlineAt(f, gi, n, coord, tC, tadv) || tC.segs.size() != segN) {
+                            err = 0.f; break;
+                        }
+                        for (size_t s = 0; s < segN; ++s) {
+                            const int q = segPts(cell.base.segs[s].type);
+                            for (int j = 0; j < q; ++j) {
+                                const float rx = cell.base.segs[s].p[j].x + pf * d.segs[s].p[j].x;
+                                const float ry = cell.base.segs[s].p[j].y + pf * d.segs[s].p[j].y;
+                                err = ImMax(err, ImMax(std::fabs(rx - tC.segs[s].p[j].x),
+                                                       std::fabs(ry - tC.segs[s].p[j].y)));
+                            }
+                        }
+                    }
+                    if (err <= tol) break;
+                    hi[i] = 0.5f * (lo[i] + hi[i]);
+                    ++f->morphBisectSteps;
+                    if (!resampleDelta(i)) { restoreUserInstance(f); cell.ok = false; return nullptr; }
+                }
+            }
+
+            // (2) Order-2 detection on the refined brackets. Single-axis drags are now
+            // exact; this captures the few dominant coupled pairs for a simultaneous
+            // multi-axis move within the cell, but only if they bring the all-axes
+            // center probe within tolerance. Sampled at the FINAL brackets so the pair
+            // deltas stay consistent with reconstruction. Usually empty.
+            float ctr[kMorphMaxAxes], frc[kMorphMaxAxes];
+            bool any = false;
+            for (int i = 0; i < n; ++i) {
+                ctr[i] = 0.5f * (lo[i] + hi[i]);
+                frc[i] = cell.active[i] ? 0.5f : 0.f;
+                any |= cell.active[i];
+            }
+            if (any) {
+                GlyphCurves bC, tC; float tadv = 0.f;
+                reconstructBlend(cell, n, frc, bC, nullptr);
+                if (sampleOutlineAt(f, gi, n, ctr, tC, tadv) && curvesMaxErr(bC, tC) > tol) {
+                    int idx[kMorphMaxAxes], m = 0;
+                    for (int i = 0; i < n; ++i) if (cell.active[i]) idx[m++] = i;
+                    auto mag = [&](int a) { return curvesMaxAbs(cell.delta[a]); };
+                    for (int a = 0; a < m; ++a)
+                        for (int b = a + 1; b < m; ++b)
+                            if (mag(idx[b]) > mag(idx[a])) std::swap(idx[a], idx[b]);
+                    const int K = ImMin(m, kMorphOrder2TopK);
+                    for (int a = 0; a < K; ++a)
+                        for (int b = a + 1; b < K; ++b)
+                            cell.pairs.push_back({ ImMin(idx[a], idx[b]), ImMax(idx[a], idx[b]) });
+
+                    bool keep = false;
+                    if (!cell.pairs.empty() && sampleCellPairs(f, gi, n, lo, hi, cell)) {
+                        std::vector<MorphPair> kp; std::vector<GlyphCurves> kd; std::vector<float> ka;
+                        for (size_t k = 0; k < cell.pairs.size(); ++k)
+                            if (curvesMaxAbs(cell.pairDelta[k]) > activeEps) {
+                                kp.push_back(cell.pairs[k]);
+                                kd.push_back(cell.pairDelta[k]);
+                                ka.push_back(cell.pairAdv[k]);
+                            }
+                        cell.pairs = kp; cell.pairDelta = kd; cell.pairAdv = ka;
+                        if (!cell.pairs.empty()) {
+                            GlyphCurves bC2; reconstructBlend(cell, n, frc, bC2, nullptr);
+                            keep = (curvesMaxErr(bC2, tC) <= tol);
+                        }
+                    }
+                    if (!keep) { cell.pairs.clear(); cell.pairDelta.clear(); cell.pairAdv.clear(); }
+                }
+            }
+        }
+        if (!cell.pairs.empty()) f->morphPairTerms += (long long)cell.pairs.size();
+        // Store the build bracket for EVERY axis. An inert axis was verified inert
+        // only over its bracket [lo,hi] (base==lo, hi toward the farther master) — NOT
+        // over the whole axis. Giving it the full [-1,1] (the old "never re-sample"
+        // shortcut) lets the cell be reused while that axis is dragged into its
+        // unverified half, where it may well move the glyph: the axis then appears
+        // frozen and, since base==outline(lo)≠outline(-1), reconstruction is corrupted.
+        // Bounding inert reuse to the verified half forces a rebuild + re-classification
+        // when the axis is dragged out of it.
+        for (int i = 0; i < n; ++i) { cell.lo[i] = lo[i]; cell.hi[i] = hi[i]; }
+        cell.n = n; cell.builtExtrap = extrapActive; cell.ok = true;
+        cell.curValid = false;        // base/deltas changed -> live blend is stale
+        cell.gpuDirty = true;         // GPU delta buffer must be re-uploaded
+        restoreUserInstance(f);
+    }
+
+    float frac[kMorphMaxAxes];
+    for (int i = 0; i < n; ++i) {
+        if (!cell.active[i]) { frac[i] = 0.f; continue; }
+        const float wdt = cell.hi[i] - cell.lo[i];   // signed (hi may be below lo)
+        float fr = (std::fabs(wdt) > 1e-9f) ? (norm[i] - cell.lo[i]) / wdt : 0.f;
+        fr = std::clamp(fr, 0.f, 1.f);
+        if (extrapActive) {   // linear continuation beyond outer master (wdt == 1)
+            const Axis& ax = f->axes[i];
+            if (ax.Value > ax.Max && ax.Max > ax.Default + 1e-6f && cell.hi[i] >= 1.f - 1e-4f)
+                fr += (ax.Value - ax.Max) / (ax.Max - ax.Default);
+            else if (ax.Value < ax.Min && ax.Default > ax.Min + 1e-6f && cell.lo[i] <= -1.f + 1e-4f)
+                fr -= (ax.Min - ax.Value) / (ax.Default - ax.Min);
+            fr = std::clamp(fr, -6.f, 6.f);
+        }
+        frac[i] = fr;
+    }
+
+    // When the GPU reconstructs this glyph (opt-in GPU morph, glyph eligible), the
+    // CPU outline blend is redundant: the shader rebuilds base + Σ weight·delta from
+    // the static delta buffer using these same fractions. So we skip the full
+    // per-frame seg blend and compute only the cell bbox + advance (which the CPU
+    // still needs to size/place the cell and lay out the line). gpuOk is set by the
+    // first buildMorphGpuData; on the rebuild frame it is still false, so that frame
+    // pays a full reconstruct (harmless — the base sample just happened anyway) and
+    // every reused frame after takes the cheap path. curFrac is still updated below
+    // because the GPU render path reads it to form the per-term weights.
+    const bool gpuReconstruct =
+        s_preferGpuMorph && glr::MorphReady() && !extrapActive && cell.gpuOk;
+
+    if (gpuReconstruct) {
+        reconstructBboxAdv(cell, n, frac, cell.cur.bboxMin, cell.cur.bboxMax, &cell.curAdv);
+        cell.curBboxOnly = true;
+        cell.curValid    = false;   // cur.segs intentionally not maintained
+        cell.curSteps    = 0;
+    } else {
+        // Update the live blend. Count how many active axes actually moved: a fresh
+        // cell, a big jump (most axes changed, e.g. the validation harness), or a long
+        // incremental run all trigger a full reconstruct (which also resets float
+        // drift); a typical single-axis drag updates just the moved axis in O(points).
+        int changed = 0, activeN = 0;
+        if (cell.curValid && !cell.curBboxOnly)
+            for (int i = 0; i < n; ++i) {
+                if (!cell.active[i]) continue;
+                ++activeN;
+                if (frac[i] != cell.curFrac[i]) ++changed;
+            }
+        const bool fullRebuild = !cell.curValid || cell.curBboxOnly ||
+                                 changed * 2 > activeN || cell.curSteps >= 256;
+        if (fullRebuild) {
+            reconstructBlend(cell, n, frac, cell.cur, &cell.curAdv);
+            cell.curSteps = 0;
+        } else {
+            applyFracDelta(cell, n, cell.cur, cell.curFrac, frac, cell.curAdv);
+            ++cell.curSteps;
+        }
+        cell.curBboxOnly = false;
+        cell.curValid    = true;
+    }
+    for (int i = 0; i < n; ++i) cell.curFrac[i] = frac[i];
+
+    if (advOut) *advOut = cell.curAdv;
+    return &cell.cur;       // advance is valid even for empty (space) glyphs
+}
+
+} // namespace detail
+
+static bool morphIsActive(const Face* f, bool hinted) {
+    return f && f->morphEnabled && f->isVariable && !hinted &&
+           !f->axes.empty() && (int)f->axes.size() <= kMorphMaxAxes &&
+           glr::LoopBlinnReady();
+}
+
+// Build and upload a (re)built cell's static GPU delta buffer (design-unit base +
+// active-axis deltas as quads) plus its conservative bbox. Quad-only: lines become
+// degenerate quads (control = midpoint); a cubic makes the glyph GPU-ineligible
+// (rendered via CPU reconstruction). Returns cell.gpuOk. Must run with a GL context.
+static bool buildMorphGpuData(MorphGlyphCell& cell, int n) {
+    cell.gpuOk = false;
+    if (cell.base.segs.empty()) return false;
+    // Extrapolation cells can drive fractions outside [0,1], which breaks the
+    // conservative-bbox assumption below (and is a rare edge case), so leave them on
+    // the CPU path.
+    if (cell.builtExtrap) return false;
+    const int maxTerms = ImMin(glr::MorphMaxTerms(), kMorphMaxGpuTerms);
+
+    const size_t segN = cell.base.segs.size();
+    auto toQuad = [](const GlyphSeg& s, glr::Curve& c) -> bool {
+        c.type = 2;
+        if (s.type == SegType::Line) {
+            c.p[0] = s.p[0].x;                  c.p[1] = s.p[0].y;
+            c.p[2] = 0.5f * (s.p[0].x + s.p[1].x);
+            c.p[3] = 0.5f * (s.p[0].y + s.p[1].y);
+            c.p[4] = s.p[1].x;                  c.p[5] = s.p[1].y;
+            return true;
+        }
+        if (s.type == SegType::Quad) {
+            c.p[0] = s.p[0].x; c.p[1] = s.p[0].y;
+            c.p[2] = s.p[1].x; c.p[3] = s.p[1].y;
+            c.p[4] = s.p[2].x; c.p[5] = s.p[2].y;
+            return true;
+        }
+        return false;                                  // cubic -> ineligible
+    };
+
+    std::vector<glr::Curve> baseQ(segN);
+    for (size_t s = 0; s < segN; ++s)
+        if (!toQuad(cell.base.segs[s], baseQ[s])) return false;
+
+    // Assemble correction terms: order-1 active-axis main effects, then order-2 kept
+    // pairs. Each term's delta is converted to quad space the SAME way as the base
+    // (the line->midpoint map is linear, so quote(base+Δ)-quote(base) is exact), and
+    // gpuTermA/B record which fractions form its weight at render time (axis: frac[a];
+    // pair: frac[a]·frac[b]).
+    int termN = 0, termA[kMorphMaxGpuTerms], termB[kMorphMaxGpuTerms];
+    std::vector<glr::Curve> deltaQ;
+    deltaQ.reserve((size_t)maxTerms * segN);
+
+    auto addTerm = [&](const GlyphCurves& d, int a, int b) -> bool {
+        if (termN >= maxTerms) return false;           // too many terms -> CPU path
+        if (d.segs.size() != segN) return false;
+        for (size_t s = 0; s < segN; ++s) {
+            GlyphSeg sum = cell.base.segs[s];
+            const int q = (sum.type == SegType::Line) ? 2
+                        : (sum.type == SegType::Quad) ? 3 : 4;
+            for (int k = 0; k < q; ++k) {
+                sum.p[k].x += d.segs[s].p[k].x;
+                sum.p[k].y += d.segs[s].p[k].y;
+            }
+            glr::Curve cs;
+            if (!toQuad(sum, cs)) return false;
+            glr::Curve dc; dc.type = 2;
+            for (int j = 0; j < 6; ++j) dc.p[j] = cs.p[j] - baseQ[s].p[j];
+            deltaQ.push_back(dc);
+        }
+        termA[termN] = a; termB[termN] = b; ++termN;
+        return true;
+    };
+
+    for (int i = 0; i < n; ++i)
+        if (cell.active[i] && !addTerm(cell.delta[i], i, -1))
+            return false;
+    for (size_t k = 0; k < cell.pairs.size(); ++k)
+        if (!addTerm(cell.pairDelta[k], cell.pairs[k].i, cell.pairs[k].j))
+            return false;
+
+    if (!glr::UpdateMorphCurves(&cell.gpuTex, baseQ.data(),
+                                termN ? deltaQ.data() : nullptr, (int)segN, termN))
+        return false;
+    cell.gpuCount = (int)segN;
+    cell.gpuTermN = termN;
+    for (int t = 0; t < termN; ++t) { cell.gpuTermA[t] = termA[t]; cell.gpuTermB[t] = termB[t]; }
+    cell.gpuOk = true;
+    return true;
+}
+
+namespace detail {
+
+// Set the FreeType face to the current (live) variation instance, so a glyph loaded
+// through FreeType (e.g. the autohinter raster path) matches the morph being shown.
+void setFaceVarToCurrent(Face* f) {
+    const int n = (int)f->axes.size();
+    if (n <= 0 || n > kMorphMaxAxes) return;
+    FT_Fixed cur[kMorphMaxAxes];
+    for (int i = 0; i < n; ++i)
+        cur[i] = valueToFixed(std::clamp(f->axes[i].Value, f->axes[i].Min, f->axes[i].Max));
+    FT_Set_Var_Design_Coordinates(f->ftFace, (FT_UInt)n, cur);
+}
+
+} // namespace detail
+
 static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
                               const FT_Outline* ol, bool hinted, float em_px,
                               float originX, float originY,
-                              float scale, float extrapX, float extrapY, ImU32 col) {
+                              float scale, float extrapX, float extrapY, ImU32 col,
+                              const GlyphCurves* morphGc = nullptr,
+                              MorphGlyphCell* morphCell = nullptr) {
     if (!glr::Ready())
         return;
 
@@ -1013,29 +1811,57 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
     const float  fbScale    = (fbScaleVec.y > 0.f) ? fbScaleVec.y : 1.f;
 
     GlyphCurves tmp;
-    const GlyphCurves& gc = hinted ? (extractCurves(ol, tmp), tmp)
-                                   : getCurvesCached(face, gi, ol);
+    const GlyphCurves& gc = morphGc ? *morphGc
+                          : hinted  ? (extractCurves(ol, tmp), tmp)
+                                    : getCurvesCached(face, gi, ol);
     if (gc.empty())
         return;
+
+    // GPU morph reconstruction: refresh the cell's static delta buffer on a rebuild.
+    // We still size/place the cell with the live blended bbox (gc) — the same tight
+    // bbox the CPU path uses — since the GPU reconstructs exactly that geometry; this
+    // keeps cells tight (no fill inflation) and tracking the morph. Falls back
+    // transparently if the glyph is ineligible.
+    bool useGpuMorph = false;
+    if (morphCell && morphGc && s_preferGpuMorph && glr::MorphReady()) {
+        if (morphCell->gpuDirty) {
+            buildMorphGpuData(*morphCell, morphCell->n);
+            morphCell->gpuDirty = false;
+        }
+        useGpuMorph = morphCell->gpuOk;
+    }
 
     const float bx0 = gc.bboxMin.x, by0 = gc.bboxMin.y;
     const float bx1 = gc.bboxMax.x, by1 = gc.bboxMax.y;
     if (bx1 <= bx0 || by1 <= by0)
         return;
 
-    // device-pixel transform (cell space, y-down)
+    // device-pixel transform (cell space, y-down): cx = pad + (x-bx0)*sx,
+    // cy = pad + (by1-y)*sy.
     const float sx = scale * extrapX * fbScale;
     const float sy = scale * extrapY * fbScale;
     if (sx <= 0.f || sy <= 0.f)
         return;
 
-    const int   pad   = 2;
-    const float gwDev = (bx1 - bx0) * sx;
-    const float ghDev = (by1 - by0) * sy;
-    const int   w     = (int)std::ceil(gwDev) + 2 * pad;
-    const int   h     = (int)std::ceil(ghDev) + 2 * pad;
+    const int   pad = 2;
+
+    // ---- small-size hinting (FreeType raster) ---------------------------------
+    // Below the cutoff, mode FreeType renders the glyph through FreeType's own
+    // autohinter + grayscale raster straight into the glyph cache — literally
+    // FreeType, no shape distortion. It runs both static and under a live morph (the
+    // glyph is re-rastered at the current instance each frame; at these sizes that is
+    // microseconds per glyph). Above the cutoff, or in mode Off, the analytic outline /
+    // GPU morph path is used unchanged.
+    const bool ftRaster = em_px < s_gridFitMaxEmPx &&
+                          s_gridFitMode == GridFitMode::FreeType &&
+                          face->ftFace != nullptr;
+
+    const int   w    = (int)std::ceil((bx1 - bx0) * sx) + 2 * pad;
+    const int   h    = (int)std::ceil((float)pad + (by1 - by0) * sy) + pad;
     if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
         return;
+
+    const float gammaFit = 1.f;   // coverage gamma (1 = linear; no stem darkening)
 
     // The atlas owns all glyph textures; invalidating just drops cache entries
     // (no texture deletion). Stale entries are also caught by the atlas-gen check
@@ -1048,14 +1874,226 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
     const uint32_t emQ = (uint32_t)(em_px * fbScale * 4.f + 0.5f);
     const uint32_t exQ = (uint32_t)(extrapX * 256.f + 0.5f);
     const uint32_t eyQ = (uint32_t)(extrapY * 256.f + 0.5f);
+    // A FreeType-rastered cell depends on the variation instance (the autohinter
+    // bakes the resolved instance), so it must not alias an unhinted cell or a cell
+    // from another instance. gfQ folds a quantized instance hash; it is 0 otherwise.
+    uint32_t gfQ = 0;
+    if (ftRaster) {
+        uint32_t ih = 2166136261u;
+        for (const Axis& a : face->axes) {
+            const uint32_t q = (uint32_t)(int)std::lround(a.Value * 16.f);
+            ih = (ih ^ q) * 16777619u;
+        }
+        gfQ = 0x80u | ((ih & 0x3FFFFFu) << 8);
+    }
     const uint64_t key = ((uint64_t)gi << 32) ^ ((uint64_t)emQ << 8) ^
-                         (uint64_t)(exQ * 2654435761u ^ (eyQ * 40503u));
+                         (uint64_t)(exQ * 2654435761u ^ (eyQ * 40503u)) ^
+                         ((uint64_t)gfQ * 0x9E3779B97F4A7C15ull);
+
+    const bool morph  = (morphGc != nullptr);
+    const bool live   = morph || (face->renderMode == RenderMode::LoopBlinnLive);
+    // Live/morph glyphs are re-rendered every frame. Prefer the analytic signed-
+    // area coverage path: it is deterministic and threshold-free (FreeType-quality
+    // AA), unlike the supersampled Loop-Blinn live path whose winding-threshold
+    // resolve sparkles/flickers frame to frame. Static Loop-Blinn mode keeps LB.
+    // Exact-curve analytic coverage (single pass, quadratics fed directly — no
+    // flattening) takes priority for live/morph glyphs when the user has opted in
+    // and it is available; otherwise the signed-area coverage path handles live.
+    const bool slugLive = live && glr::PreferSlug();
+    const bool covLive = live && !slugLive && glr::CoverageReady();
+    const bool lbMode  = !slugLive && !covLive &&
+                         (morph || face->renderMode == RenderMode::LoopBlinn ||
+                          face->renderMode == RenderMode::LoopBlinnLive) &&
+                         glr::LoopBlinnReady();
 
     glr::GlyphTex tex;
-    auto it = face->glyphTexCache.find(key);
-    if (it != face->glyphTexCache.end() && it->second.valid &&
-        it->second.gen == glr::AtlasGen()) {
-        tex = it->second;
+    bool cached = false;
+    int  ftW = 0, ftH = 0, ftLeft = 0, ftTop = 0;   // FreeType-raster cell (mode FreeType)
+    if (!live) {
+        auto it = face->glyphTexCache.find(key);
+        if (it != face->glyphTexCache.end() && it->second.valid &&
+            it->second.gen == glr::AtlasGen())
+            { tex = it->second; cached = true; }
+    }
+    if (ftRaster) {
+        // FreeType's own autohinter + grayscale raster. We use LIGHT hinting: it snaps
+        // only on the Y axis (baseline / x-height / caps -> crisp), and does NO horizontal
+        // hinting, so glyph widths, side bearings and advances are left exactly as designed
+        // (the autohinter does not widen the 'e' relative to the 'a'). That also keeps the
+        // advance equal to the unhinted width our layout already uses, so the rastered cells
+        // do not collide. Sync FT to the live variation instance, raster, then reuse the
+        // cached cell (static) or upload a fresh one. Under a live morph this runs every
+        // frame into the transient page; at these sizes it is cheap.
+        setFaceVarToCurrent(face);
+        face->syncedEmPx = -1.f;   // we drive FT_Set_Pixel_Sizes directly here
+        const int ppi = (std::max)(1, (int)std::lround(em_px * fbScale));
+        if (FT_Set_Pixel_Sizes(face->ftFace, 0, (FT_UInt)ppi) == 0 &&
+            FT_Load_Glyph(face->ftFace, gi, FT_LOAD_FORCE_AUTOHINT | FT_LOAD_TARGET_LIGHT) == 0 &&
+            FT_Render_Glyph(face->ftFace->glyph, FT_RENDER_MODE_NORMAL) == 0) {
+            const FT_Bitmap& bm = face->ftFace->glyph->bitmap;
+            ftW    = (int)bm.width;
+            ftH    = (int)bm.rows;
+            ftLeft = face->ftFace->glyph->bitmap_left;
+            ftTop  = face->ftFace->glyph->bitmap_top;
+            if (cached) {
+                // reuse cached texture; geometry recovered above for placement
+            } else if (ftW > 0 && ftH > 0 && bm.buffer && bm.pixel_mode == FT_PIXEL_MODE_GRAY) {
+                std::vector<unsigned char> a8((size_t)ftW * ftH, 0);
+                const int pitch = bm.pitch;
+                for (int r = 0; r < ftH; ++r) {
+                    const unsigned char* srow = bm.buffer + (ptrdiff_t)r * pitch;
+                    std::memcpy(&a8[(size_t)r * ftW], srow, (size_t)ftW);
+                }
+                tex = glr::UploadGlyph(a8.data(), ftW, ftH, /*live=*/live);
+                if (tex.valid && !live) face->glyphTexCache[key] = tex;
+            }
+        }
+        if (!tex.valid)
+            return;
+    } else if (cached) {
+        // cached analytic / Loop-Blinn cell reused as-is
+    } else if (useGpuMorph) {
+        // GPU morph reconstruction: control points are rebuilt on the GPU from the
+        // static delta buffer with the current axis fractions as uniforms — no CPU
+        // outline blend, no per-frame curve upload. Just gather the active-axis
+        // fractions (already computed by morphBlendGlyph) and the cell transform.
+        float weight[kMorphMaxGpuTerms];
+        for (int t = 0; t < morphCell->gpuTermN; ++t) {
+            const int a = morphCell->gpuTermA[t], b = morphCell->gpuTermB[t];
+            weight[t] = (b < 0) ? morphCell->curFrac[a]
+                                : morphCell->curFrac[a] * morphCell->curFrac[b];
+        }
+        // Cell-pixel affine, y-up: cx = oxu + sx·x, cy = oyu + sy·y.
+        const float oxu = (float)pad - bx0 * sx;
+        const float oyu = (float)h - (float)pad - by1 * sy;
+        tex = glr::RenderMorphGlyph(morphCell->gpuTex, morphCell->gpuCount,
+                                    morphCell->gpuTermN, weight, oxu, oyu, sx, sy,
+                                    w, h, gammaFit, /*live=*/true);
+        if (!tex.valid && morphGc) {
+            // Rare GPU-path failure: fall back to CPU-blended curves -> Slug coverage.
+            // The blend ran bbox-only (cur.segs is stale), so reconstruct the real
+            // outline once here from the same fractions before flattening.
+            GlyphCurves fbTmp;
+            const std::vector<GlyphSeg>* srcSegs = &gc.segs;
+            if (morphCell->curBboxOnly) {
+                reconstructBlend(*morphCell, (int)face->axes.size(),
+                                 morphCell->curFrac, fbTmp, nullptr);
+                srcSegs = &fbTmp.segs;
+            }
+            std::vector<glr::Curve> C; C.reserve(srcSegs->size());
+            for (const GlyphSeg& s : *srcSegs) {
+                ImVec2 P[4];
+                const int nn = (s.type == SegType::Line) ? 2
+                             : (s.type == SegType::Quad) ? 3 : 4;
+                for (int i = 0; i < nn; ++i) {
+                    P[i].x = (float)pad + (s.p[i].x - bx0) * sx;
+                    P[i].y = (float)pad + (by1 - s.p[i].y) * sy;
+                }
+                if (s.type == SegType::Line) {
+                    glr::Curve cc; cc.type = 1;
+                    cc.p[0]=P[0].x; cc.p[1]=P[0].y; cc.p[2]=P[1].x; cc.p[3]=P[1].y;
+                    C.push_back(cc);
+                } else if (s.type == SegType::Quad) {
+                    glr::Curve cc; cc.type = 2;
+                    cc.p[0]=P[0].x; cc.p[1]=P[0].y; cc.p[2]=P[1].x; cc.p[3]=P[1].y;
+                    cc.p[4]=P[2].x; cc.p[5]=P[2].y;
+                    C.push_back(cc);
+                } else {
+                    cubicToQuads(C, P[0], P[1], P[2], P[3], 0.2f, 0);
+                }
+            }
+            if (!C.empty())
+                tex = glr::RenderGlyphSlug(C.data(), (int)C.size(), w, h, gammaFit, true);
+        }
+    } else if (slugLive) {
+        // Exact-curve analytic coverage: hand lines/quadratics straight to the GPU
+        // as curves (cubics converted to quadratics); the fragment shader computes
+        // exact-area coverage in one supersample-free pass. Transient live cell,
+        // re-rendered every frame from the (CPU-blended) morph output.
+        std::vector<glr::Curve> C;
+        C.reserve(gc.segs.size());
+        for (const GlyphSeg& s : gc.segs) {
+            ImVec2 P[4];
+            const int n = (s.type == SegType::Line) ? 2
+                        : (s.type == SegType::Quad) ? 3 : 4;
+            for (int i = 0; i < n; ++i) {
+                P[i].x = (float)pad + (s.p[i].x - bx0) * sx;
+                P[i].y = (float)pad + (by1 - s.p[i].y) * sy;
+            }
+            if (s.type == SegType::Line) {
+                glr::Curve cc; cc.type = 1;
+                cc.p[0] = P[0].x; cc.p[1] = P[0].y;
+                cc.p[2] = P[1].x; cc.p[3] = P[1].y;
+                C.push_back(cc);
+            } else if (s.type == SegType::Quad) {
+                glr::Curve cc; cc.type = 2;
+                cc.p[0] = P[0].x; cc.p[1] = P[0].y;
+                cc.p[2] = P[1].x; cc.p[3] = P[1].y;
+                cc.p[4] = P[2].x; cc.p[5] = P[2].y;
+                C.push_back(cc);
+            } else {
+                cubicToQuads(C, P[0], P[1], P[2], P[3], 0.2f, 0);
+            }
+        }
+        if (C.empty())
+            return;
+        tex = glr::RenderGlyphSlug(C.data(), (int)C.size(), w, h, gammaFit, live);
+    } else if (covLive) {
+        // Analytic signed-area coverage into a transient (live) cell: re-rendered
+        // every frame for morph/animation, deterministic and flicker-free. Curves
+        // are flattened to edges (cubics via quads) in cell space.
+        std::vector<float> E;
+        E.reserve(gc.segs.size() * 4);
+        const float tolSq = 0.18f * 0.18f;
+        for (const GlyphSeg& s : gc.segs) {
+            ImVec2 P[4];
+            const int n = (s.type == SegType::Line) ? 2
+                        : (s.type == SegType::Quad) ? 3 : 4;
+            for (int i = 0; i < n; ++i) {
+                P[i].x = (float)pad + (s.p[i].x - bx0) * sx;
+                P[i].y = (float)pad + (by1 - s.p[i].y) * sy;
+            }
+            if (s.type == SegType::Line)      pushEdge(E, P[0], P[1]);
+            else if (s.type == SegType::Quad) flatQuad(E, P[0], P[1], P[2], tolSq, 0);
+            else                              flatCubic(E, P[0], P[1], P[2], P[3], tolSq, 0);
+        }
+        if (E.empty())
+            return;
+        tex = glr::RenderGlyph(E.data(), (int)(E.size() / 4), w, h, gammaFit, /*live=*/true);
+    } else if (lbMode) {
+        // Loop-Blinn path: hand lines and quadratics to the GPU as analytic
+        // curves; cubics (CFF/OTF) are converted to analytic quadratics. In live
+        // mode the cell is transient (re-rendered every frame, never cached).
+        std::vector<glr::Curve> C;
+        C.reserve(gc.segs.size());
+        for (const GlyphSeg& s : gc.segs) {
+            ImVec2 P[4];
+            const int n = (s.type == SegType::Line) ? 2
+                        : (s.type == SegType::Quad) ? 3 : 4;
+            for (int i = 0; i < n; ++i) {
+                P[i].x = (float)pad + (s.p[i].x - bx0) * sx;
+                P[i].y = (float)pad + (by1 - s.p[i].y) * sy;
+            }
+            if (s.type == SegType::Line) {
+                glr::Curve cc; cc.type = 1;
+                cc.p[0] = P[0].x; cc.p[1] = P[0].y;
+                cc.p[2] = P[1].x; cc.p[3] = P[1].y;
+                C.push_back(cc);
+            } else if (s.type == SegType::Quad) {
+                glr::Curve cc; cc.type = 2;
+                cc.p[0] = P[0].x; cc.p[1] = P[0].y;
+                cc.p[2] = P[1].x; cc.p[3] = P[1].y;
+                cc.p[4] = P[2].x; cc.p[5] = P[2].y;
+                C.push_back(cc);
+            } else {
+                cubicToQuads(C, P[0], P[1], P[2], P[3], 0.2f, 0);
+            }
+        }
+        if (C.empty())
+            return;
+        tex = glr::RenderGlyphCurves(C.data(), (int)C.size(), w, h, gammaFit, live);
+        if (!live)
+            face->glyphTexCache[key] = tex;
     } else if (glr::CoverageReady()) {
         // GPU path: flatten curves to edges and accumulate signed coverage.
         std::vector<float> E;
@@ -1075,11 +2113,12 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
         }
         if (E.empty())
             return;
-        tex = glr::RenderGlyph(E.data(), (int)(E.size() / 4), w, h, 1.0f);
+        tex = glr::RenderGlyph(E.data(), (int)(E.size() / 4), w, h, gammaFit);
         face->glyphTexCache[key] = tex;
-    } else {
+    } else if (!morph) {
         // CPU fallback (ES2 / WebGL1 / no blendable float): FreeType rasterizes
-        // the outline into the same device cell, uploaded into the atlas.
+        // the outline into the same device cell, uploaded into the atlas. Only
+        // reached when not morphing and GPU coverage is unavailable.
         std::vector<unsigned char> a8;
         if (!rasterOutlineCPU(face->library, ol, w, h, sx, sy, bx0, by1, pad, a8))
             return;
@@ -1091,19 +2130,28 @@ static void fillGlyphAnalytic(ImDrawList* dl, Face* face, FT_UInt gi,
 
     // Place the device cell back into logical screen space. A design point
     // (nx,ny) maps to screen (originX + nx*scale*extrapX, originY - ny*scale*extrapY).
-    const float sxl     = scale * extrapX;
-    const float syl     = scale * extrapY;
-    const float scrXmin = originX + bx0 * sxl;        // left  (min x)
-    const float scrYmin = originY - by1 * syl;        // top   (max y)
-    const ImVec2 pmin(scrXmin - (float)pad / fbScale, scrYmin - (float)pad / fbScale);
-    const ImVec2 pmax(pmin.x + (float)w / fbScale,    pmin.y + (float)h / fbScale);
+    const float sxl = scale * extrapX;
+
+    float        pminX, pminY;
+    int          cellW = w, cellH = h;
+    if (ftRaster) {
+        // FreeType places the bitmap by integer pen bearings on a snapped baseline.
+        const float bDev = std::round(originY * fbScale);
+        pminX = originX + (float)ftLeft / fbScale;
+        pminY = (bDev - (float)ftTop) / fbScale;
+        cellW = ftW; cellH = ftH;
+    } else {
+        const float syl = scale * extrapY;
+        pminX = (originX + bx0 * sxl) - (float)pad / fbScale;
+        pminY = (originY - by1 * syl) - (float)pad / fbScale;
+    }
+    const ImVec2 pmin(pminX, pminY);
+    const ImVec2 pmax(pmin.x + (float)cellW / fbScale, pmin.y + (float)cellH / fbScale);
 
     // GlyphTex UVs are pre-oriented: (u0,v0)->pmin (top-left), (u1,v1)->pmax.
     dl->AddImage((ImTextureID)(intptr_t)tex.tex, pmin, pmax,
                  ImVec2(tex.u0, tex.v0), ImVec2(tex.u1, tex.v1), col);
 }
-
-} // namespace
 
 bool InitRenderer(void* (*gl_get_proc_address)(const char*)) {
     return glr::Init((glr::GLProc)gl_get_proc_address);
@@ -1117,6 +2165,79 @@ bool RendererReady() {
 void ForceCpuFallback(bool enable) {
     glr::SetForceCpuFallback(enable);
 }
+void PreferSlugRenderer(bool enable) {
+    glr::SetPreferSlug(enable);
+}
+bool PreferSlugRenderer() {
+    return glr::PreferSlug();
+}
+bool SlugRendererAvailable() {
+    return glr::SlugReady();
+}
+
+// Release every cell's GPU delta-buffer texture before dropping the cells. Safe to
+// call with no GL context (handles are 0 when the GPU morph path was never used).
+static void freeMorphCacheGpu(Face* face) {
+    for (auto& kv : face->morphCache)
+        glr::DeleteMorphCurves(&kv.second.gpuTex);
+}
+
+void PreferGpuMorphRenderer(bool enable) {
+    if (s_preferGpuMorph == enable) return;
+    s_preferGpuMorph = enable;
+}
+bool PreferGpuMorphRenderer() {
+    return s_preferGpuMorph;
+}
+bool GpuMorphAvailable() {
+    return glr::MorphReady();
+}
+
+void PreferGridFit(bool enable) {
+    s_gridFit = enable;
+    s_gridFitMode = enable ? GridFitMode::FreeType : GridFitMode::Off;
+}
+bool PreferGridFit() {
+    return s_gridFit;
+}
+
+void PreferGridFitMode(GridFitMode mode) {
+    s_gridFitMode = mode;
+    s_gridFit = (mode != GridFitMode::Off);
+}
+GridFitMode PreferGridFitMode() {
+    return s_gridFitMode;
+}
+
+void PreferGridFitMaxPx(float px) {
+    s_gridFitMaxEmPx = ImClamp(px, 6.f, 96.f);
+}
+float PreferGridFitMaxPx() {
+    return s_gridFitMaxEmPx;
+}
+
+void EnableMorph(Face* face, bool enable, bool allow_extrapolation) {
+    if (!face) return;
+    // Only discard the cached cells when the morph *mode* actually changes.
+    // Callers commonly invoke this once per frame to sync UI state; wiping the
+    // cache unconditionally would force a full FreeType re-sample + adaptive
+    // cell rebuild for every glyph every frame, which is both wasteful and a
+    // source of frame-to-frame instability (borderline refinement decisions can
+    // flip between rebuilds). Axis-value changes are handled downstream by the
+    // blend-coord cache and the per-cell reuse test, so they need no reset here.
+    if (face->morphEnabled == enable && face->morphExtrap == allow_extrapolation)
+        return;
+    face->morphEnabled = enable;
+    face->morphExtrap  = allow_extrapolation;
+    freeMorphCacheGpu(face);
+    face->morphCache.clear();   // re-sample base + deltas on next use
+    face->morphNormValid = false;
+}
+
+bool MorphEnabled(const Face* face) {
+    return face && face->morphEnabled;
+}
+
 
 struct StrokeOutlineCtx {
     ImDrawList* dl          = nullptr;
@@ -1220,11 +2341,14 @@ static void decomposeStrokeOutline(StrokeOutlineCtx& ctx, const FT_Outline* ol) 
 // ============================================================================
 
 static bool usesHintedPipeline(const Face* face) {
-    return face && face->renderMode != RenderMode::Vector;
+    // Vector and Loop-Blinn both consume unhinted, size-independent design-unit
+    // outlines; only HintedVector and Raster drive FreeType's hinted pipeline.
+    return face && (face->renderMode == RenderMode::HintedVector ||
+                    face->renderMode == RenderMode::Raster);
 }
 
 static FT_Int32 buildLoadFlags(const Face* face) {
-    if (!face || face->renderMode == RenderMode::Vector)
+    if (!face || !usesHintedPipeline(face))
         return FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING;
 
     FT_Int32 flags = FT_LOAD_DEFAULT;
@@ -1244,7 +2368,7 @@ static FT_Int32 buildLoadFlags(const Face* face) {
 
 // hb-ft expects scaled 26.6 px metrics (face char size set). It does not handle FT_LOAD_NO_SCALE.
 static FT_Int32 buildHbLoadFlags(const Face* face) {
-    if (!face || face->renderMode == RenderMode::Vector)
+    if (!face || !usesHintedPipeline(face))
         return FT_LOAD_DEFAULT | FT_LOAD_NO_HINTING;
     return buildLoadFlags(face);
 }
@@ -1266,6 +2390,8 @@ static void syncFaceCharSize(Face* face, float em_px) {
 
 void SetRenderMode(Face* face, RenderMode mode) {
     if (!face) return;
+    if (face->renderMode == mode)
+        return;
     face->renderMode = mode;
     face->syncedEmPx = -1.f;
     ++face->outlineGen;
@@ -1277,6 +2403,8 @@ void SetRenderMode(Face* face, RenderMode mode) {
 
 void SetHintingFlags(Face* face, HintingFlags flags) {
     if (!face) return;
+    if (face->hintingFlags == flags)
+        return;
     face->hintingFlags = flags;
     face->syncedEmPx = -1.f;
     ++face->outlineGen;
@@ -1299,7 +2427,7 @@ static GlyphMetricsCtx makeGlyphCtx(Face* face, float em_px) {
     if (!face || !face->ftFace || em_px <= 0.f)
         return ctx;
 
-    if (face->renderMode == RenderMode::Vector) {
+    if (!usesHintedPipeline(face)) {
         ctx.outline_scale = (face->ftFace->units_per_EM > 0)
                             ? em_px / (float)face->ftFace->units_per_EM : 1.f;
         ctx.load_flags    = FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING;
@@ -1330,12 +2458,13 @@ static void getVerticalMetrics(Face* face, float em_px,
         if (line_height) *line_height = (float)m.height / 64.f;
     } else {
         const FT_Face ft = face->ftFace;
+        resolveVMetrics(face);   // canonical, instance-independent design metrics
         const float scale = (ft->units_per_EM > 0)
                             ? em_px / (float)ft->units_per_EM : 1.f;
-        if (ascender)    *ascender    = (float)ft->ascender * scale;
-        if (descender)   *descender   = -(float)ft->descender * scale;
-        if (line_height) *line_height = (ft->height > 0)
-                                        ? (float)ft->height * scale : em_px * 1.2f;
+        if (ascender)    *ascender    = (float)face->metricAsc * scale;
+        if (descender)   *descender   = -(float)face->metricDesc * scale;
+        if (line_height) *line_height = (face->metricHeight > 0)
+                                        ? (float)face->metricHeight * scale : em_px * 1.2f;
     }
 }
 
@@ -1421,6 +2550,30 @@ static float renderGlyphByIndex(ImDrawList* dl, Face* face, FT_UInt gi,
     FT_Face ft = face->ftFace;
     if (gi == 0) return 0.f;
 
+    // Morph path: blend cached master corners instead of re-instancing FreeType.
+    // Advance and outline both come from the blend; no per-frame FT_Load_Glyph.
+    if (morphIsActive(face, gctx.hinted)) {
+        profFrameTick();
+        float advDesign = 0.f;
+        MorphGlyphCell* mcell = nullptr;
+        const auto tBlend = ProfClock::now();
+        const GlyphCurves* mg = morphBlendGlyph(face, gi, &advDesign, &mcell);
+        s_prof.blendMs += profMsSince(tBlend);
+        if (mg) {
+            const float adv = advDesign * gctx.outline_scale;
+            if (dl && filled && !mg->empty()) {
+                const auto tRaster = ProfClock::now();
+                fillGlyphAnalytic(dl, face, gi, nullptr, false, gctx.em_px,
+                                  origin_x, origin_y, gctx.outline_scale,
+                                  1.f, 1.f, col, mg, mcell);
+                s_prof.rasterMs += profMsSince(tRaster);
+                ++s_prof.glyphs;
+            }
+            return adv;   // outline stroking is not morphed in this version
+        }
+        // Blend unavailable (e.g. topology mismatch): fall through to FreeType.
+    }
+
     if (FT_Load_Glyph(ft, gi, gctx.load_flags) != 0)
         return 0.f;
 
@@ -1442,10 +2595,15 @@ static float renderGlyphByIndex(ImDrawList* dl, Face* face, FT_UInt gi,
     // Glyph fill uses the analytic GPU coverage renderer (signed-area, non-zero
     // winding) for faithful counters and conflation-free anti-aliasing. Requires
     // InitRenderer() to have succeeded; otherwise filled text is skipped.
-    if (filled)
+    if (filled) {
+        profFrameTick();
+        const auto tRaster = ProfClock::now();
         fillGlyphAnalytic(dl, face, gi, ol, gctx.hinted, gctx.em_px,
                           origin_x, origin_y,
                           gctx.outline_scale, extrapX, extrapY, col);
+        s_prof.rasterMs += profMsSince(tRaster);
+        ++s_prof.glyphs;
+    }
 
     if (strokeOutline) {
         StrokeOutlineCtx ctx;
@@ -1718,6 +2876,15 @@ void LayoutGlyphs(Face* face, const char* text, float em_px,
 
 void* GetFtFace(Face* face) {
     return (face && face->ftFace) ? (void*)face->ftFace : nullptr;
+}
+
+RenderProfile GetRenderProfile() {
+    RenderProfile p;
+    p.blendMs  = (float)s_profLast.blendMs;
+    p.rasterMs = (float)s_profLast.rasterMs;
+    p.glyphs   = s_profLast.glyphs;
+    p.rebuilds = s_profLast.rebuilds;
+    return p;
 }
 
 // ============================================================================

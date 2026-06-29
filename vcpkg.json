@@ -1,10 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "name": "imvarfonts",
-  "version": "0.1.0",
+  "name": "imvarfont",
+  "version": "1.1.0",
   "description": "Variable-font rendering and axis controls for Dear ImGui",
   "dependencies": [
-    "freetype",
-    "clipper2"
+    "freetype"
   ]
 }
