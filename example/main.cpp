@@ -25,9 +25,12 @@
 #endif
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <filesystem>
 
 
 // ---------------------------------------------------------------------------
@@ -69,6 +72,17 @@ static unsigned int     g_rasterTex        = 0;
 static int              g_rasterTexW       = 0;
 static int              g_rasterTexH       = 0;
 static std::vector<uint8_t> g_rasterPixels;
+
+// Offscreen frame dump: --capture <dir> <WxH> <frames>
+static bool             g_captureMode     = false;
+static char             g_captureDir[512] = "";
+static int              g_captureW        = 600;
+static int              g_captureH        = 600;
+static int              g_captureFrames   = 64;
+static int              g_captureIndex    = 0;
+static int              g_captureWarmup   = 4;   // settle GPU / ImGui before dumping
+static int              g_wghtAxis        = -1;
+static int              g_wdthAxis        = -1;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -192,6 +206,63 @@ static void freeRasterTexture() {
     }
     g_rasterTexW = g_rasterTexH = 0;
     g_rasterPixels.clear();
+}
+
+// Binary PPM (P6) — Pillow reads it; avoids pulling in an image encoder.
+static bool saveFramePpm(const char* path, int w, int h, const uint8_t* rgba) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    std::vector<uint8_t> row(w * 3);
+    // GL origin is bottom-left; flip vertically while writing.
+    for (int y = h - 1; y >= 0; --y) {
+        const uint8_t* src = rgba + (size_t)y * w * 4;
+        for (int x = 0; x < w; ++x) {
+            row[x * 3 + 0] = src[x * 4 + 0];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + 2];
+        }
+        fwrite(row.data(), 1, row.size(), f);
+    }
+    fclose(f);
+    return true;
+}
+
+static void findWghtWdthAxes() {
+    g_wghtAxis = g_wdthAxis = -1;
+    if (!g_face) return;
+    const int n = ImVarFont::GetAxisCount(g_face);
+    ImVarFont::Axis* axes = ImVarFont::GetAxes(g_face);
+    const uint32_t wght = ImVarFont::MakeTag('w', 'g', 'h', 't');
+    const uint32_t wdth = ImVarFont::MakeTag('w', 'd', 't', 'h');
+    for (int i = 0; i < n; ++i) {
+        if (axes[i].Tag == wght) g_wghtAxis = i;
+        if (axes[i].Tag == wdth) g_wdthAxis = i;
+    }
+}
+
+// Same cos/sin drive as VarFont research/tools/make_readme_gif.py
+static void applyCaptureAxisFrame(int fi, int n) {
+    if (!g_face || n <= 0) return;
+    ImVarFont::Axis* axes = ImVarFont::GetAxes(g_face);
+    const float t = 2.f * 3.14159265f * (float)fi / (float)n;
+    if (g_wghtAxis >= 0) {
+        const auto& a = axes[g_wghtAxis];
+        float v = a.Default + 0.34f * (a.Max - a.Default) * std::cos(t);
+        ImVarFont::SetAxisValue(g_face, g_wghtAxis, v, true);
+    }
+    if (g_wdthAxis >= 0) {
+        const auto& a = axes[g_wdthAxis];
+        float v = a.Default + 0.26f * (a.Max - a.Default) * std::sin(t + 0.55f);
+        ImVarFont::SetAxisValue(g_face, g_wdthAxis, v, true);
+    }
+}
+
+static bool parseSizeWxH(const char* s, int* w, int* h) {
+    int ww = 0, hh = 0;
+    if (sscanf(s, "%dx%d", &ww, &hh) != 2 || ww < 64 || hh < 64) return false;
+    *w = ww; *h = hh;
+    return true;
 }
 
 // GLFW drag-and-drop: accept the first dropped file as the font path
@@ -657,6 +728,83 @@ static void DrawKernTable() {
     ImGui::End();
 }
 
+// Compact single-window layout for --capture (square / banner GIFs).
+static void DrawCaptureScene() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertFloat4ToU32(g_bgColor));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.f, 12.f));
+    ImGui::Begin("##capture", nullptr, flags);
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor();
+
+    ImGui::TextDisabled("ImVarFont");
+    ImGui::SameLine();
+    ImGui::TextDisabled("· variable-font morph");
+
+    const float sliderH = (g_face && ImVarFont::IsVariable(g_face)) ? 110.f : 0.f;
+    const ImVec2 canvasPos  = ImGui::GetCursorScreenPos();
+    ImVec2 canvasSize = ImGui::GetContentRegionAvail();
+    canvasSize.y = std::max(40.f, canvasSize.y - sliderH);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(canvasPos,
+                      { canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y },
+                      ImGui::ColorConvertFloat4ToU32(g_bgColor));
+
+    if (g_face) {
+        syncRenderSettings();
+        const float emPx = g_emPx;
+        const float lineH = ImVarFont::CalcLineHeightPx(g_face, emPx) * g_lineHeightMult;
+        const float letterSp = g_letterSpacingEm * emPx;
+        float textW = 0.f, textH = 0.f;
+        calcTextBlock(g_face, emPx, lineH, letterSp, g_text, &textW, &textH);
+
+        const ImVec2 center = {
+            canvasPos.x + canvasSize.x * 0.5f,
+            canvasPos.y + canvasSize.y * 0.5f
+        };
+        const float posX = center.x - textW * 0.5f;
+        const float posY = center.y - textH * 0.5f;
+        ImU32 col = ImGui::ColorConvertFloat4ToU32(g_textColor);
+
+        ImVarFont::TextStyle st;
+        st.line_height_px    = lineH;
+        st.letter_spacing_px = letterSp;
+        ImVarFont::AddText(dl, g_face, emPx, { posX, posY }, col, g_text, st);
+    }
+
+    ImGui::Dummy(canvasSize);
+
+    if (g_face && ImVarFont::IsVariable(g_face)) {
+        ImGui::Separator();
+        // Show only weight + width so the square preview stays readable.
+        ImVarFont::Axis* axes = ImVarFont::GetAxes(g_face);
+        if (g_wghtAxis >= 0) {
+            auto& a = axes[g_wghtAxis];
+            ImGui::TextUnformatted(a.Name[0] ? a.Name : "wght");
+            ImGui::SetNextItemWidth(-1.f);
+            ImGui::SliderFloat("##cap_wght", &a.Value, a.Min, a.Max, "%.0f");
+        }
+        if (g_wdthAxis >= 0) {
+            auto& a = axes[g_wdthAxis];
+            ImGui::TextUnformatted(a.Name[0] ? a.Name : "wdth");
+            ImGui::SetNextItemWidth(-1.f);
+            ImGui::SliderFloat("##cap_wdth", &a.Value, a.Min, a.Max, "%.0f");
+        }
+    }
+
+    ImGui::End();
+}
+
 // ---------------------------------------------------------------------------
 // GLFW / OpenGL boilerplate
 // ---------------------------------------------------------------------------
@@ -672,9 +820,27 @@ int main(int argc, char** argv) {
 
     // Optional: pass a .ttf/.otf path as the first non-option argument.
     // Otherwise drop a font on the window or use Load in Controls.
+    // Capture: --capture <dir> <WxH> <frames>
     const char* cliFont = nullptr;
     for (int i = 1; i < argc; ++i) {
-        if (argv[i][0] != '-') { cliFont = argv[i]; break; }
+        if (strcmp(argv[i], "--capture") == 0) {
+            if (i + 3 >= argc) {
+                fprintf(stderr, "usage: --capture <dir> <WxH> <frames>\n");
+                NFD_Quit();
+                return 1;
+            }
+            g_captureMode = true;
+            strncpy(g_captureDir, argv[++i], sizeof(g_captureDir) - 1);
+            if (!parseSizeWxH(argv[++i], &g_captureW, &g_captureH)) {
+                fprintf(stderr, "bad size (expected e.g. 600x600)\n");
+                NFD_Quit();
+                return 1;
+            }
+            g_captureFrames = atoi(argv[++i]);
+            if (g_captureFrames < 1) g_captureFrames = 1;
+        } else if (argv[i][0] != '-') {
+            cliFont = argv[i];
+        }
     }
 
     glfwSetErrorCallback(glfwErrorCb);
@@ -695,18 +861,23 @@ int main(int argc, char** argv) {
 #endif
 #endif
 
-    constexpr int W = 1920, H = 1080;
+    const int W = g_captureMode ? g_captureW : 1920;
+    const int H = g_captureMode ? g_captureH : 1080;
     GLFWwindow* window = glfwCreateWindow(W, H,
-                                           "ImVarFont  –  Variable Font Viewer",
+                                           g_captureMode
+                                               ? "ImVarFont  –  capture"
+                                               : "ImVarFont  –  Variable Font Viewer",
                                            nullptr, nullptr);
     if (!window) { glfwTerminate(); return 1; }
 
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
+    glfwSwapInterval(g_captureMode ? 0 : 1);
 
     // ── DPI scale (HiDPI / 4K support) ───────────────────────────────────────
     glfwGetWindowContentScale(window, &g_dpi_scale, nullptr);
     if (g_dpi_scale < 1.0f) g_dpi_scale = 1.0f;  // sanity clamp
+    if (g_captureMode)
+        g_dpi_scale = 1.0f;  // keep capture pixels predictable
 
     // ── Drag-and-drop ─────────────────────────────────────────────────────────
     glfwSetDropCallback(window, dropCallback);
@@ -716,7 +887,8 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    if (!g_captureMode)
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
     // Style  (scale all sizes by DPI so padding / borders feel right on 4K)
     ImGui::StyleColorsDark();
@@ -750,16 +922,58 @@ int main(int argc, char** argv) {
         tryLoadFont();
     }
 
+    if (g_captureMode) {
+        if (!g_face) {
+            fprintf(stderr, "capture requires a font path argument\n");
+            ImVarFont::ShutdownRenderer();
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            glfwDestroyWindow(window);
+            glfwTerminate();
+            NFD_Quit();
+            return 1;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(g_captureDir, ec);
+        if (ec) {
+            fprintf(stderr, "cannot create capture dir %s: %s\n",
+                    g_captureDir, ec.message().c_str());
+            return 1;
+        }
+        // Demo defaults tuned for a readable square / banner loop.
+        strncpy(g_text, "ImVarFont", sizeof(g_text) - 1);
+        g_emPx = (g_captureH <= 500) ? 72.f : 96.f;
+        g_morph = true;
+        g_bgColor = { 0.06f, 0.07f, 0.10f, 1.00f };
+        g_textColor = { 1.00f, 1.00f, 1.00f, 1.00f };
+        findWghtWdthAxes();
+        ImVarFont::EnableMorph(g_face, true, false);
+        if (ImVarFont::SlugRendererAvailable())
+            ImVarFont::PreferSlugRenderer(true);
+        applyCaptureAxisFrame(0, g_captureFrames);
+        fprintf(stderr, "capture → %s  %dx%d  %d frames\n",
+                g_captureDir, g_captureW, g_captureH, g_captureFrames);
+    }
+
     rebuildUiFont();
 
 
     // ── Main loop ────────────────────────────────────────────────────────────
-    int appliedSwap = 1;  // matches glfwSwapInterval(1) above
+    int appliedSwap = g_captureMode ? 0 : 1;
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
         const int wantSwap = g_vsync ? 1 : 0;
-        if (wantSwap != appliedSwap) { glfwSwapInterval(wantSwap); appliedSwap = wantSwap; }
+        if (!g_captureMode && wantSwap != appliedSwap) {
+            glfwSwapInterval(wantSwap);
+            appliedSwap = wantSwap;
+        }
+
+        if (g_captureMode && g_captureWarmup <= 0) {
+            const int fi = std::min(g_captureIndex, g_captureFrames - 1);
+            applyCaptureAxisFrame(fi, g_captureFrames);
+        }
 
         if (g_uiFontDirty)
             rebuildUiFont();
@@ -768,12 +982,16 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        DrawDockSpace();
-        DrawPerformance();
-        DrawControls();
-        DrawPreview();
-        DrawMetadata();
-        DrawKernTable();
+        if (g_captureMode) {
+            DrawCaptureScene();
+        } else {
+            DrawDockSpace();
+            DrawPerformance();
+            DrawControls();
+            DrawPreview();
+            DrawMetadata();
+            DrawKernTable();
+        }
 
         // ── Render ──────────────────────────────────────────────────────────
         ImGui::Render();
@@ -783,6 +1001,25 @@ int main(int argc, char** argv) {
         glClearColor(g_bgColor.x, g_bgColor.y, g_bgColor.z, g_bgColor.w);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        if (g_captureMode) {
+            if (g_captureWarmup > 0) {
+                --g_captureWarmup;
+            } else if (g_captureIndex < g_captureFrames) {
+                std::vector<uint8_t> px((size_t)fbW * fbH * 4);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glReadPixels(0, 0, fbW, fbH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                char path[768];
+                snprintf(path, sizeof(path), "%s/frame_%04d.ppm",
+                         g_captureDir, g_captureIndex);
+                if (!saveFramePpm(path, fbW, fbH, px.data()))
+                    fprintf(stderr, "failed to write %s\n", path);
+                ++g_captureIndex;
+                if (g_captureIndex >= g_captureFrames)
+                    glfwSetWindowShouldClose(window, GLFW_TRUE);
+            }
+        }
+
         glfwSwapBuffers(window);
     }
 
