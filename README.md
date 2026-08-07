@@ -1,5 +1,7 @@
 # ImVarFont
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21836771.svg)](https://zenodo.org/records/21836771)
+
 **v1.1.0** · Variable-font rendering and axis controls for [Dear ImGui](https://github.com/ocornut/imgui).
 
 ![preview](example/preview.png)
