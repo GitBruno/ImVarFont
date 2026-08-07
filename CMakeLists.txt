@@ -73,21 +73,29 @@ target_link_libraries(imgui_impl PUBLIC glfw ${IMVARFONT_GL_LIBS} Freetype::Free
 add_library(varfont_gl STATIC varfont_gl.cpp)
 target_include_directories(varfont_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(varfont_gl PUBLIC ${IMVARFONT_GL_LIBS})
+if(IMVARFONT_GLES)
+    target_compile_definitions(varfont_gl PUBLIC IMVARFONT_GLES=1)
+endif()
 
-# Dear ImGui integration (+ FreeType morph core)
+# Engine core (Face / morph / layout) — no Dear ImGui
+add_library(varfont_core STATIC varfont_core.cpp)
+target_include_directories(varfont_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(varfont_core PUBLIC varfont_gl Freetype::Freetype)
+if(IMVARFONT_HARFBUZZ_FOUND)
+    target_compile_definitions(varfont_core PUBLIC IMVARFONT_USE_HARFBUZZ)
+    target_link_libraries(varfont_core PUBLIC PkgConfig::HARFBUZZ)
+    message(STATUS "ImVarFont: HarfBuzz enabled")
+else()
+    message(STATUS "ImVarFont: HarfBuzz not found (kern table only)")
+endif()
+
+# Dear ImGui adapter (widgets + AddText → ImDrawList)
 add_library(imvarfont STATIC imgui_var_font.cpp)
 target_include_directories(imvarfont PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${imgui_SOURCE_DIR}
 )
-target_link_libraries(imvarfont PUBLIC varfont_gl Freetype::Freetype imgui_impl)
-if(IMVARFONT_HARFBUZZ_FOUND)
-    target_compile_definitions(imvarfont PUBLIC IMVARFONT_USE_HARFBUZZ)
-    target_link_libraries(imvarfont PUBLIC PkgConfig::HARFBUZZ)
-    message(STATUS "ImVarFont: HarfBuzz enabled")
-else()
-    message(STATUS "ImVarFont: HarfBuzz not found (kern table only)")
-endif()
+target_link_libraries(imvarfont PUBLIC varfont_core imgui_impl)
 
 # Interactive example
 add_executable(ImVarFontExample example/main.cpp)

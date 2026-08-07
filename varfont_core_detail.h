@@ -1,11 +1,12 @@
-// imgui_var_font_detail.h — internal types for imgui_var_font.cpp.
-// Not part of the public API; do not include from application code.
+// varfont_core_detail.h — internal types for varfont_core.cpp.
+// Not part of the public API; do not include from application code. The Dear
+// ImGui adapter (imgui_var_font.cpp) includes it to read Face fields for the
+// metadata / kerning inspectors.
 
 #pragma once
 
-#include "imgui_var_font.h"
+#include "varfont_core.h"
 #include "varfont_gl.h"
-#include "imgui.h"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -20,7 +21,11 @@
 #include <hb.h>
 #endif
 
-namespace ImVarFont {
+namespace VarFont {
+
+// varfont_gl declares the atlas under ImVarFont::glr and aliases it as
+// VarFont::gl. `glr::` is the canonical spelling in engine sources.
+namespace glr = ImVarFont::glr;
 
 struct FontMetadata {
     std::string copyright;
@@ -42,13 +47,13 @@ enum class SegType : uint8_t { Line, Quad, Cubic };
 
 struct GlyphSeg {
     SegType type;
-    ImVec2  p[4];
+    Vec2    p[4];
 };
 
 struct GlyphCurves {
     std::vector<GlyphSeg> segs;
-    ImVec2 bboxMin {  1e30f,  1e30f };
-    ImVec2 bboxMax { -1e30f, -1e30f };
+    Vec2 bboxMin {  1e30f,  1e30f };
+    Vec2 bboxMax { -1e30f, -1e30f };
     bool   empty() const { return segs.empty(); }
 };
 
@@ -137,15 +142,19 @@ namespace detail {
 
 FT_Fixed valueToFixed(float v);
 void extractCurves(const FT_Outline* ol, GlyphCurves& out);
-void pushEdge(std::vector<float>& E, const ImVec2& a, const ImVec2& b);
-void flatQuad(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2, float tolSq, int depth);
-void flatCubic(std::vector<float>& E, ImVec2 p0, ImVec2 p1, ImVec2 p2, ImVec2 p3, float tolSq, int depth);
+void pushEdge(std::vector<float>& E, const Vec2& a, const Vec2& b);
+void flatQuad(std::vector<float>& E, Vec2 p0, Vec2 p1, Vec2 p2, float tolSq, int depth);
+void flatCubic(std::vector<float>& E, Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, float tolSq, int depth);
 bool rasterOutlineCPU(FT_Library lib, const FT_Outline* ol, int w, int h, float sx, float sy,
                       float bx0, float by1, int pad, std::vector<unsigned char>& a8);
 void setFaceVarToCurrent(Face* f);
 const GlyphCurves* morphBlendGlyph(Face* f, FT_UInt gi, float* advOut,
                                    MorphGlyphCell** outCell = nullptr);
 
+// Canonical, instance-independent vertical metrics (OS/2 / hhea). Cached on the
+// face; the metadata inspector in the ImGui adapter needs it too.
+void resolveVMetrics(Face* f);
+
 } // namespace detail
 
-} // namespace ImVarFont
+} // namespace VarFont

@@ -33,7 +33,12 @@
 // (EXT_float_blend is only needed for 32-bit float), so additive accumulation
 // works without it.
 
-#if defined(IMGUI_IMPL_OPENGL_ES3)
+// Desktop GL 3.3 by default; GLES 3.0 for Raspberry Pi / embedded.
+// Prefer IMVARFONT_GLES (our flag). Map ImGui's ES3 define only as a fallback
+// when an ImGui-hosting app already set it.
+#if defined(IMVARFONT_GLES)
+  // already set by the build (0 or 1)
+#elif defined(IMGUI_IMPL_OPENGL_ES3)
   #define IMVARFONT_GLES 1
 #else
   #define IMVARFONT_GLES 0

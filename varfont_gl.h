@@ -1,10 +1,10 @@
-// varfont_gl.h — GPU analytic glyph coverage (VarFont engine, renderer layer)
+// varfont_gl.h — GPU analytic glyph coverage (VarFont renderer layer)
 //
-// This is the public renderer layer of the VarFont engine: it has no Dear ImGui
-// dependency (ImGui is one possible compositor of the atlas it produces).
+// Owns the coverage atlas / FBOs / shaders. No Dear ImGui dependency — ImGui
+// (or OF / your engine) is a host that composites GlyphTex / GlyphQuad output.
 //
-// Narrow GL seam between the font/morph/layout layer and the GPU:
-// atlas packing, live pages, and multiple coverage backends in this module:
+// Narrow GL seam between Face/morph/layout and the GPU: atlas packing, live
+// pages, and multiple coverage backends in this module:
 //   - signed-area accumulation (RenderGlyph, edge soup)
 //   - Loop-Blinn quadratics (RenderGlyphCurves)
 //   - Slug exact-curve coverage (RenderGlyphSlug)
@@ -23,11 +23,11 @@ typedef void* (*GLProc)(const char*);
 // One rasterized glyph, packed into a shared RGBA8 atlas page (shelf packer).
 // Small/medium cells share atlas pages so many glyphs batch into one draw call;
 // cells too large for the atlas fall back to a dedicated texture. The texture
-// holds (1,1,1,coverage) so ImGui's default shader composites it as
-// colour*coverage with no custom shader.
+// holds (1,1,1,coverage), so a stock textured-quad shader (ImGui's included)
+// composites it as colour*coverage with nothing custom.
 //
 // (u0,v0) is the UV that maps to the on-screen top-left (pmin); (u1,v1) maps to
-// the bottom-right (pmax) — i.e. already oriented for ImGui, no flip needed.
+// the bottom-right (pmax) — already screen-oriented, no flip needed.
 //
 // `gen` stamps which atlas generation this entry belongs to. The atlas is owned
 // by the renderer (never freed per-glyph); when it is reset the generation is
